@@ -30,12 +30,13 @@ review video จึงใช้พื้นที่มากกว่าขน�
 ## Deploy บน Render
 
 ใน root ของ repository มี [`render.yaml`](../render.yaml) สำหรับ Blueprint ของ
-Render แล้ว โดยกำหนดเป็น web service แบบหนึ่ง instance, persistent disk ที่
-`/var/data` และใช้:
+Render แล้ว โดยเป็น Free demo service แบบหนึ่ง instance และใช้ temporary
+storage:
 
 ```text
-WEB_JOBS_DIR=/var/data/web_jobs
-MODEL_DIR=/var/data/pretrained_models
+WEB_JOBS_DIR=/tmp/sn-gamestate/web_jobs
+MODEL_DIR=/tmp/sn-gamestate/pretrained_models
+MAX_UPLOAD_BYTES=104857600
 ```
 
 ขั้นตอน:
@@ -44,11 +45,10 @@ MODEL_DIR=/var/data/pretrained_models
    เดียวกับโปรเจกต์
 2. ใน Render เลือก **New + > Blueprint** แล้วเลือก repository/branch นั้น
 3. ตรวจสอบชื่อบริการและเลือก region ที่ใกล้ผู้ใช้ จากนั้นสร้าง service
-4. Blueprint เลือกแผน `2c-8g` และ disk 25 GB เป็นจุดเริ่มต้นเท่านั้น
-   เพิ่ม RAM/CPU และขนาด disk ให้สอดคล้องกับความยาวคลิปและจำนวนงานที่เก็บไว้
+4. Blueprint ใช้ Render Free และจำกัดไฟล์อัปโหลดไว้ 100 MB
 5. รอ build เสร็จ แล้วเปิด URL ของ Render; health check ที่ `/` ต้องตอบ 200
 6. ส่งคลิปสั้นโดยเลือก `MVP` และ `CPU` ก่อน เมื่อโมเดลถูกดาวน์โหลดครั้งแรก
-   ระบบจะเก็บไว้ใต้ persistent disk เพื่อใช้ต่อในครั้งถัดไป
+   ระบบจะเก็บไว้ใน temporary storage ของ instance นั้น
 
 `render.yaml` pin `PYTHON_VERSION=3.9.25`, ใช้ `uv sync --frozen --no-dev` เพื่อ
 ยึด dependency ตาม `uv.lock` และติดตั้ง MMCV ซึ่งเป็น dependency แยกของ pipeline. หากขั้น build ของ MMCV
@@ -63,13 +63,11 @@ Render กำหนด `PORT` ให้ service และแอป bind ที�
 
 - Blueprint นี้เป็น CPU service; เลือก `CPU` หรือ `Auto` ในหน้าเว็บ อย่าเลือก
   `CUDA` เว้นแต่ย้ายไปยัง environment ที่มี CUDA และ Torch build ที่ตรงกัน
-- persistent disk ใช้ได้กับ paid service และผูกกับ instance เดียว. ห้าม scale
-  หลาย instance สำหรับแอปเวอร์ชันนี้ เพราะ job state อยู่ใน memory และ pipeline
-  ต้องทำงานทีละงาน
-- disk ไม่พร้อมระหว่าง build แต่พร้อมตอน runtime; ด้วยเหตุนี้ model checkpoints
-  จะถูกดาวน์โหลดตอนรันงานแรก ไม่ใช่ใน build command
-- ไฟล์ที่ผู้ใช้อัปโหลดอยู่ใน disk เดียวกันและไม่มีระบบลบอัตโนมัติ ต้องกำหนด
-  retention/cleanup ก่อนเปิดใช้งานจริง มิฉะนั้น disk จะเต็ม
+- Free service ใช้ filesystem ชั่วคราว: restart, deploy หรือ instance ถูกหยุด
+  จะลบวิดีโอ, output และ model checkpoints ทั้งหมด จึงต้องดาวน์โหลดโมเดลใหม่
+  ในงานถัดไป
+- Free plan เหมาะกับ demo คลิปสั้นเท่านั้น ไม่รับประกันว่า dependency หนัก ๆ
+  จะ build สำเร็จหรือมี RAM/CPU เพียงพอสำหรับ inference
 - web app ไม่มี authentication, rate limit หรือ malware scanning. อย่าเปิดเป็น
   public upload endpoint จนกว่าจะเพิ่มชั้นป้องกันเหล่านี้
 - การประมวลผลมี CPU/RAM/disk สูงและนานกว่าคำขอ HTTP ปกติ; Render เหมาะสำหรับ

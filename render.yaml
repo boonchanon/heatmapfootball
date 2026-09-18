@@ -2,7 +2,7 @@ services:
   - type: web
     name: sn-gamestate-web
     runtime: python
-    plan: 2c-8g
+    plan: free
     buildCommand: uv sync --frozen --no-dev && uv run --no-sync mim install mmcv==2.0.1
     startCommand: uv run --no-sync python tools/web_app.py
     healthCheckPath: /
@@ -10,10 +10,8 @@ services:
       - key: PYTHON_VERSION
         value: 3.9.25
       - key: WEB_JOBS_DIR
-        value: /var/data/web_jobs
+        value: /tmp/sn-gamestate/web_jobs
       - key: MODEL_DIR
-        value: /var/data/pretrained_models
-    disk:
-      name: video-data
-      mountPath: /var/data
-      sizeGB: 25
+        value: /tmp/sn-gamestate/pretrained_models
+      - key: MAX_UPLOAD_BYTES
+        value: "104857600"

@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parents[1]
 JOBS = Path(os.environ.get('WEB_JOBS_DIR', ROOT / 'outputs' / 'web_jobs')).resolve()
 MODEL_DIR = Path(os.environ.get('MODEL_DIR', ROOT / 'pretrained_models')).resolve()
-MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', str(2 * 1024 * 1024 * 1024)))
 ALLOWED_SUFFIXES = {'.mp4', '.mov', '.avi', '.mkv'}
 LOCK = threading.Lock()
 PROCESS_LOCK = threading.Lock()
@@ -136,7 +136,9 @@ class App(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != '/api/jobs': self.send_error(404); return
         length = int(self.headers.get('Content-Length', '0'))
-        if not 0 < length <= MAX_UPLOAD_BYTES: self.send_json({'error': 'ไฟล์ว่างหรือใหญ่เกิน 2 GB'}, 413); return
+        if not 0 < length <= MAX_UPLOAD_BYTES:
+            limit_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
+            self.send_json({'error': f'ไฟล์ว่างหรือใหญ่เกิน {limit_mb} MB'}, 413); return
         form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST', 'CONTENT_TYPE': self.headers['Content-Type']})
         if 'video' not in form or not getattr(form['video'], 'file', None): self.send_json({'error': 'กรุณาเลือกวิดีโอ'}, 400); return
         upload = form['video']; suffix = Path(upload.filename or '').suffix.lower()
