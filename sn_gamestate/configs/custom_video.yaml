@@ -1,0 +1,27 @@
+# Reuse the audited SoccerNet pipeline and override only custom-input settings.
+defaults:
+  - soccernet
+  - override dataset: youtube
+  - _self_
+
+experiment_name: custom-video
+home_dir: ${oc.env:USERPROFILE,${oc.env:HOME,.}}
+num_cores: 0
+use_wandb: false
+eval_tracking: false
+
+dataset:
+  eval_set: val
+  nvid: -1
+  nframes: -1
+  vids_dict: {val: []}
+
+modules:
+  bbox_detector: {batch_size: 1}
+  reid: {batch_size: 8}
+  track: {batch_size: 1}
+  pitch: {batch_size: 1}
+  calibration:
+    batch_size: 1
+    use_prev_homography: false
+  jersey_number_detect: {batch_size: 1}

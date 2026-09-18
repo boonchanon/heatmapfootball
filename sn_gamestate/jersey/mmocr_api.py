@@ -1,7 +1,6 @@
 import pandas as pd
 import torch
 import numpy as np
-from mmocr.apis import MMOCRInferencer
 # from mmengine.infer.infer import BaseInferencer
 from mmocr.apis import TextDetInferencer, TextRecInferencer
 from mmocr.utils import ConfigType, bbox2poly, crop_img, poly2bbox
@@ -22,7 +21,6 @@ class MMOCR(DetectionLevelModule):
 
     def __init__(self, batch_size, device, tracking_dataset=None):
         super().__init__(batch_size=batch_size)
-        self.ocr = MMOCRInferencer(det='dbnet_resnet18_fpnc_1200e_icdar2015', rec='SAR')
         self.batch_size = batch_size
 
         self.textdetinferencer = TextDetInferencer(
@@ -92,7 +90,6 @@ class MMOCR(DetectionLevelModule):
         # import pickle
         # with open('images_np.pkl', 'wb') as f:
         #     pickle.dump(images_np, f)
-        # predictions = self.ocr(images_np, **self.cfg)['predictions']
 
         predictions = self.run_mmocr_inference(images_np)
         for prediction in predictions:

@@ -1,4 +1,5 @@
 configs_user/
+.audit/
 runs/
 data/
 models/

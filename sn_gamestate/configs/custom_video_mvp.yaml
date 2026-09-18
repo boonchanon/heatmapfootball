@@ -1,0 +1,28 @@
+# Minimal real-video path: detector, IoU/motion tracker, pitch keypoints, projection.
+defaults:
+  - custom_video
+  - override modules/track: bpbreid_strong_sort
+  - override visualization: none
+  - _self_
+
+pipeline:
+  - bbox_detector
+  - reid
+  - track
+  - pitch
+  - calibration
+
+modules:
+  bbox_detector: {batch_size: 1}
+  reid: {batch_size: 8}
+  track:
+    batch_size: 1
+    cfg:
+      ecc: true
+      max_age: 75
+      max_kalman_prediction_without_update: 20
+      n_init: 3
+  pitch: {batch_size: 1}
+  calibration:
+    batch_size: 1
+    use_prev_homography: false

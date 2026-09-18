@@ -50,6 +50,9 @@ class TrackletTeamClustering(VideoLevelModule):
             embedding_tracklet['team_cluster'] = kmeans.labels_
 
         # Map the team cluster back to the original detections DataFrame
-        detections = detections.merge(embedding_tracklet[['track_id', 'team_cluster']], on='track_id', how='left', sort=False)
+        # TrackLab joins module outputs by detection index, not row position.
+        clusters = embedding_tracklet.set_index('track_id')['team_cluster']
+        detections = detections.copy()
+        detections['team_cluster'] = detections['track_id'].map(clusters)
 
         return detections

@@ -20,6 +20,7 @@ dependencies = [
     "numpy==1.26.4",
     "transformers==4.35.2",
     "tokenizers==0.15.2",
+    "imageio-ffmpeg==0.6.0",
 ]
 
 [project.entry-points.tracklab_plugin]
@@ -33,7 +34,7 @@ build-backend = "setuptools.build_meta"
 include = ["sn_gamestate*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.txt", "*.rst", "*.yaml"]
+"*" = ["*.txt", "*.rst", "*.yaml", "*.html", "*.js"]
 
 [project.optional-dependencies]
 dev = ["ipykernel==6.29.4"]
