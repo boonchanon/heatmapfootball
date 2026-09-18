@@ -46,7 +46,8 @@ MAX_UPLOAD_BYTES=104857600
 2. ใน Render เลือก **New + > Blueprint** แล้วเลือก repository/branch นั้น
 3. ตรวจสอบชื่อบริการและเลือก region ที่ใกล้ผู้ใช้ จากนั้นสร้าง service
 4. Blueprint ใช้ Render Free และจำกัดไฟล์อัปโหลดไว้ 100 MB
-5. รอ build เสร็จ แล้วเปิด URL ของ Render; health check ที่ `/` ต้องตอบ 200
+5. รอ build เสร็จ แล้วเปิด URL ของ Render; health check ที่ `/healthz` ต้องตอบ
+   `{"status":"ok"}` และไม่ต้องรอ pipeline
 6. ส่งคลิปสั้นโดยเลือก `MVP` และ `CPU` ก่อน เมื่อโมเดลถูกดาวน์โหลดครั้งแรก
    ระบบจะเก็บไว้ใน temporary storage ของ instance นั้น
 
