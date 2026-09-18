@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+import gc
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +33,7 @@ ALLOWED_SUFFIXES = {'.mp4', '.mov', '.avi', '.mkv'}
 LOCK = threading.Lock()
 PROCESS_LOCK = threading.Lock()
 STATE = {}
+MAX_FRAMES = 250
 
 
 def job_paths(job_id):
@@ -49,17 +51,29 @@ def public_state(job_id):
     return state
 
 
+def log_memory(state, phase):
+    """Log process RSS without adding a heavyweight runtime dependency."""
+    try:
+        rss = int(Path('/proc/self/statm').read_text().split()[1]) * os.sysconf('SC_PAGE_SIZE')
+        message = f'[RAM] phase={phase} rss_mb={rss / 1048576:.1f}'
+    except (OSError, ValueError, IndexError):
+        message = f'[RAM] phase={phase} rss=unavailable'
+    with Path(state['log_path']).open('a', encoding='utf-8') as log:
+        log.write(message + '\n')
+
+
 def run_command(command, state, label):
     state.update(phase=label, detail='กำลังประมวลผล อาจใช้เวลาหลายนาที…')
     log_path = Path(state['log_path'])
     with log_path.open('a', encoding='utf-8') as log:
         log.write(f'\n$ {subprocess.list2cmdline(command)}\n')
-    result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
+    log_memory(state, f'before:{label}')
     with log_path.open('a', encoding='utf-8') as log:
-        log.write(result.stdout or '')
-        log.write(result.stderr or '')
+        # Streaming prevents a verbose model subprocess from filling web RAM.
+        result = subprocess.run(command, cwd=ROOT, text=True, stdout=log, stderr=subprocess.STDOUT)
+    log_memory(state, f'after:{label}')
     if result.returncode:
-        detail = (result.stderr or result.stdout).strip()
+        detail = log_path.read_text(encoding='utf-8')[-4000:] or f'Command exited with code {result.returncode}'
         if not detail:
             detail = f'คำสั่งจบด้วย exit code {result.returncode}: {subprocess.list2cmdline(command)}'
         state.update(status='failed', phase='ไม่สำเร็จ', detail='การประมวลผลหยุดด้วยข้อผิดพลาด',
@@ -148,8 +162,10 @@ class App(BaseHTTPRequestHandler):
         if suffix not in ALLOWED_SUFFIXES: self.send_json({'error': 'รองรับเฉพาะ MP4, MOV, AVI, MKV'}, 400); return
         stage = form.getfirst('stage', 'mvp'); device = form.getfirst('device', 'auto')
         if stage not in {'mvp', 'calibrate', 'full'} or device not in {'auto', 'cpu', 'cuda'}: self.send_json({'error': 'ตัวเลือกไม่ถูกต้อง'}, 400); return
-        try: max_frames = int(form.getfirst('max_frames') or 0)
+        try: max_frames = int(form.getfirst('max_frames') or MAX_FRAMES)
         except ValueError: self.send_json({'error': 'จำนวนเฟรมต้องเป็นตัวเลข'}, 400); return
+        if not 1 <= max_frames <= MAX_FRAMES:
+            self.send_json({'error': f'max_frames must be between 1 and {MAX_FRAMES}'}, 400); return
         job_id = uuid.uuid4().hex[:12]; paths = job_paths(job_id); paths['folder'].mkdir(parents=True)
         with paths['upload'].open('wb') as destination: shutil.copyfileobj(upload.file, destination)
         with LOCK:

@@ -116,10 +116,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--video', type=Path,
+                        help='Original source video; decoded sequentially for streaming review')
     parser.add_argument('--clean', action='store_true', help='Larger video, colored IDs and short observed trails')
     args = parser.parse_args()
     if args.clean:
         from sn_gamestate.custom_video.review import clean_review
-        clean_review(args.run, args.output)
+        clean_review(args.run, args.output, args.video or args.run.parent / 'upload.mp4')
     else:
         review(args.run, args.output)

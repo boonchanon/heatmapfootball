@@ -46,7 +46,7 @@ def trail_points(history, frame, point, max_points):
     return [p for _, p in history]
 
 
-def clean_review(run, output):
+def clean_review(run, output, video_path):
     run, output = Path(run), Path(output)
     output.mkdir(parents=True, exist_ok=False)
     with zipfile.ZipFile(run / 'tracker_state.pklz') as archive:
@@ -59,6 +59,9 @@ def clean_review(run, output):
     duration = len(images) / fps
     raw_video = output / 'review_raw.mp4'
     browser_video = output / 'review.mp4'
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f'Cannot open source video for review: {video_path}')
     writer = cv2.VideoWriter(str(raw_video), cv2.VideoWriter_fourcc(*'mp4v'), fps, (1920, 900))
     if not writer.isOpened():
         raise RuntimeError('Cannot open MP4 encoder')
@@ -69,9 +72,11 @@ def clean_review(run, output):
         return round(1598 + x * 5), round(410 + y * 5)
     try:
         for sequence, (image_id, image) in enumerate(images.iterrows()):
-            raw = cv2.imread(image.file_path)
-            if raw is None:
-                raise ValueError(f'Missing frame: {image.file_path}')
+            ok, raw = capture.read()
+            if not ok:
+                raise ValueError(f'Cannot decode source frame {sequence}')
+            if raw.shape[1] > video['width']:
+                raw = cv2.resize(raw, (video['width'], video['height']), interpolation=cv2.INTER_AREA)
             canvas = np.full((900, 1920, 3), (23, 21, 18), dtype=np.uint8)
             # Fit without distortion, including videos that are not 16:9.
             scale = min(1280/raw.shape[1], 720/raw.shape[0])
@@ -165,6 +170,7 @@ def clean_review(run, output):
                 cv2.imwrite(str(output/f'frame_{int(image.frame):03d}.jpg'),canvas)
     finally:
         writer.release()
+        capture.release()
     make_browser_video(raw_video, browser_video)
     raw_video.unlink()
     metadata.update(review_layout='clean',review_width=1920,review_height=900,

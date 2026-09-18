@@ -4,11 +4,13 @@ import json
 import math
 import os
 import platform
+import gc
+import shutil
 from contextlib import contextmanager
 from importlib import metadata
 from pathlib import Path
 
-from .video import extracted_frame_paths, inspect_video
+from .video import extracted_frame_paths, inspect_video, stream_resized_frames, validate_max_frames
 
 
 STAGES = {
@@ -19,6 +21,21 @@ STAGES = {
     'full': ['bbox_detector', 'reid', 'track', 'pitch', 'calibration',
              'jersey_number_detect', 'tracklet_agg', 'team', 'team_side'],
 }
+
+
+def memory_checkpoint(phase):
+    """Fail safely before the container OOM killer restarts the web service."""
+    try:
+        rss = int(Path('/proc/self/statm').read_text().split()[1]) * os.sysconf('SC_PAGE_SIZE')
+        limit_text = Path('/sys/fs/cgroup/memory.max').read_text().strip()
+        limit = 0 if limit_text == 'max' else int(limit_text)
+    except (OSError, ValueError, IndexError):
+        print(f'[RAM] phase={phase} rss=unavailable', flush=True)
+        return
+    ratio = float(os.environ.get('RAM_LIMIT_RATIO', '0.85'))
+    print(f'[RAM] phase={phase} rss_mb={rss / 1048576:.1f} limit_mb={limit / 1048576:.1f}', flush=True)
+    if limit and rss >= limit * ratio:
+        raise MemoryError(f'RAM guard at {phase}: {rss / 1048576:.0f} MB exceeds {ratio:.0%} of limit')
 
 
 def check_environment(require_optional=True):
@@ -128,6 +145,7 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
         raise ValueError(f'Unknown stage: {stage}')
     if device not in {'auto', 'cpu', 'cuda'}:
         raise ValueError(f'Unknown device: {device}')
+    max_frames = validate_max_frames(max_frames)
     video_metadata = inspect_video(video)
     environment = check_environment(require_optional=stage != 'mvp')
     if environment['errors']:
@@ -142,53 +160,64 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
     from tracklab.datastruct import TrackerState
     from tracklab.engine import OfflineTrackingEngine
     from tracklab.pipeline import Pipeline
-    from tracklab.wrappers.dataset.external_video import (
-        ExternalVideo, write_video_images_to_disk,
-    )
+    from tracklab.wrappers.dataset.external_video import ExternalVideo
 
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA requested but unavailable; refusing silent CPU fallback')
-    cfg = build_config(video, output, model_dir, video_metadata, stage)
     output.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=True, exist_ok=True)
     torch.hub.set_dir(str(model_dir / 'torch_hub'))
-    with working_directory(output):
-        OmegaConf.save(cfg, output / 'resolved_config.yaml')
-        print(f'Running stage={stage}, device={device}, output={output}', flush=True)
-        dataset = ExternalVideo(**OmegaConf.to_container(cfg.dataset, resolve=True))
-        image_folder = write_video_images_to_disk(video).resolve()
-        tracking_set = dataset.sets['val']
-        if max_frames is not None:
-            if max_frames <= 0:
-                raise ValueError('max_frames must be positive')
-            tracking_set.image_metadatas = tracking_set.image_metadatas.iloc[:max_frames].copy()
+    frame_cache = output / '_frames_tmp'
+    modules = pipeline = state = engine = dataset = None
+    try:
+        memory_checkpoint('before_decode')
+        # Decode sequentially and cap/resize before any model sees a frame.
+        streamed = stream_resized_frames(video, frame_cache, max_frames=max_frames)
+        memory_checkpoint('after_decode')
+        video_metadata.update({key: streamed[key] for key in ('frame_count', 'width', 'height')})
+        cfg = build_config(video, output, model_dir, video_metadata, stage)
+        with working_directory(output):
+            OmegaConf.save(cfg, output / 'resolved_config.yaml')
+            print(f'Running stage={stage}, device={device}, output={output}', flush=True)
+            dataset = ExternalVideo(**OmegaConf.to_container(cfg.dataset, resolve=True))
+            image_folder = frame_cache
+            tracking_set = dataset.sets['val']
+            tracking_set.image_metadatas = tracking_set.image_metadatas.iloc[:streamed['frame_count']].copy()
             tracking_set.image_gt = tracking_set.image_metadatas.copy()
-        if len(tracking_set.image_metadatas) != video_metadata['frame_count']:
-            if max_frames is None:
-                raise RuntimeError('Frame count changed between metadata scan and TrackLab')
-        tracking_set.image_metadatas['file_path'] = extracted_frame_paths(
-            image_folder, video.stem, tracking_set.image_metadatas.frame)
-        tracking_set.image_gt = tracking_set.image_metadatas.copy()
-        modules = [instantiate(cfg.modules[name], device=device, tracking_dataset=dataset)
-                   for name in cfg.pipeline]
-        pipeline = Pipeline(models=modules)
-        state = TrackerState(tracking_set, pipeline=pipeline,
-                             save_file=output / 'tracker_state.pklz')
-        engine = OfflineTrackingEngine(modules=pipeline, tracker_state=state,
-                                       num_workers=0, callbacks={})
-        engine.track_dataset()
-        evidence = summarize_state(state.detections_pred, state.image_pred)
-        from .export import export_tracking
+            tracking_set.image_metadatas['file_path'] = extracted_frame_paths(
+                image_folder, video.stem, tracking_set.image_metadatas.frame)
+            tracking_set.image_gt = tracking_set.image_metadatas.copy()
+            modules = [instantiate(cfg.modules[name], device=device, tracking_dataset=dataset)
+                       for name in cfg.pipeline]
+            pipeline = Pipeline(models=modules)
+            state = TrackerState(tracking_set, pipeline=pipeline,
+                                 save_file=output / 'tracker_state.pklz')
+            engine = OfflineTrackingEngine(modules=pipeline, tracker_state=state,
+                                           num_workers=0, callbacks={})
+            memory_checkpoint('before_inference')
+            engine.track_dataset()
+            memory_checkpoint('after_inference')
+            evidence = summarize_state(state.detections_pred, state.image_pred)
+            from .export import export_tracking
 
-        export_tracking(state.detections_pred, state.image_pred, video_metadata, output)
+            export_tracking(state.detections_pred, state.image_pred, video_metadata, output)
         # This is run evidence, not frontend tracking export or a fabricated result.
-        evidence.update(video=video_metadata, stage=stage, device=device,
-                frames_processed=len(state.image_pred),
-                        environment=environment['versions'])
-        (output / 'inference_evidence.json').write_text(
-            json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False),
-            encoding='utf-8')
-        print(json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False))
-        return evidence
+            evidence.update(video=video_metadata, stage=stage, device=device,
+                    frames_processed=len(state.image_pred),
+                            environment=environment['versions'])
+            (output / 'inference_evidence.json').write_text(
+                json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False),
+                encoding='utf-8')
+            print(json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False))
+            return evidence
+    finally:
+        # Model tensors and decoded frame cache must not survive a job.
+        del engine, state, pipeline, modules, dataset
+        shutil.rmtree(frame_cache, ignore_errors=True)
+        try:
+            if 'torch' in locals() and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        finally:
+            gc.collect()
