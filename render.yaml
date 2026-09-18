@@ -6,7 +6,6 @@ services:
     buildCommand: uv sync --frozen --no-dev && uv run --no-sync mim install mmcv==2.0.1
     startCommand: uv run --no-sync python tools/web_app.py
     healthCheckPath: /
-    maxShutdownDelaySeconds: 300
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.25
