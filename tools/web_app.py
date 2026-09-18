@@ -11,6 +11,7 @@ import cgi
 import argparse
 import json
 import mimetypes
+import os
 import shutil
 import subprocess
 import sys
@@ -24,7 +25,8 @@ from urllib.parse import parse_qs, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
-JOBS = ROOT / 'outputs' / 'web_jobs'
+JOBS = Path(os.environ.get('WEB_JOBS_DIR', ROOT / 'outputs' / 'web_jobs')).resolve()
+MODEL_DIR = Path(os.environ.get('MODEL_DIR', ROOT / 'pretrained_models')).resolve()
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 ALLOWED_SUFFIXES = {'.mp4', '.mov', '.avi', '.mkv'}
 LOCK = threading.Lock()
@@ -74,7 +76,8 @@ def process(job_id, stage, device, max_frames):
         try:
             state.update(status='running', phase='กำลังเริ่มงาน', detail='เตรียมโมเดลและวิดีโอ…')
             command = [sys.executable, 'tools/analyze_video.py', '--video', str(paths['upload']),
-                       '--output', str(paths['run']), '--stage', stage, '--device', device]
+                       '--output', str(paths['run']), '--model-dir', str(MODEL_DIR),
+                       '--stage', stage, '--device', device]
             if max_frames:
                 command += ['--max-frames', str(max_frames)]
             if not run_command(command, state, 'ตรวจจับและติดตามผู้เล่น'):
@@ -155,10 +158,12 @@ class App(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--port', type=int, default=8001, help='Local HTTP port (default: 8001)')
+    parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', '8001')),
+                        help='HTTP port (default: PORT environment variable or 8001)')
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535:
         parser.error('--port must be between 1024 and 65535')
     JOBS.mkdir(parents=True, exist_ok=True)
-    print(f'Open http://127.0.0.1:{args.port}')
-    ThreadingHTTPServer(('127.0.0.1', args.port), App).serve_forever()
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    print(f'Serving on http://0.0.0.0:{args.port}')
+    ThreadingHTTPServer(('0.0.0.0', args.port), App).serve_forever()
