@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 
 from .export import export_tracking, _finite_pitch
+from .identity import stabilize_identities
+from .scene_validation import build_frame_decisions
 
 
 def make_browser_video(raw_video, output_video):
@@ -54,6 +56,11 @@ def clean_review(run, output):
         images = pd.read_pickle(archive.open('0_image.pkl')).sort_values('frame')
     evidence = json.loads((run / 'inference_evidence.json').read_text())
     video = evidence['video']
+    decisions = build_frame_decisions(images)
+    detections, identity_summary = stabilize_identities(
+        detections, images, video['fps'],
+        {index.item() if hasattr(index, 'item') else index: value.get('segment_id')
+         for index, value in decisions.items()})
     _, metadata = export_tracking(detections, images, video, output)
     fps = video['fps']
     duration = len(images) / fps
@@ -81,7 +88,7 @@ def clean_review(run, output):
             text(canvas, 'MATCH REVIEW', (24, 43), 1., thickness=2)
             text(canvas, f'{sequence/fps:05.2f} / {duration:.2f} s', (1010, 43), .8)
             text(canvas, 'FIELD VIEW', (1338, 110), .95, thickness=2)
-            text(canvas, 'Colors identify tracks, not teams', (1338, 145), .55)
+            text(canvas, 'Colors identify stable identities, not teams', (1338, 145), .55)
             cv2.rectangle(canvas, pitch_point(-52.5, -34), pitch_point(52.5, 34), (43, 76, 42), -1)
             white = (185, 203, 191)
             for xa, ya, xb, yb in [(-52.5,-34,52.5,34),(-52.5,-20.16,-36,20.16),
@@ -100,7 +107,9 @@ def clean_review(run, output):
                     px, py = pitch_point(p['pitch_x'], p['pitch_y'])
                     occupied.append((px-6, py-6, px+6, py+6))
             for _, row in rows.iterrows():
-                track = None if pd.isna(row.track_id) else int(row.track_id)
+                identity_value = row.get('identity_id')
+                track = None if pd.isna(identity_value) else int(identity_value)
+                identity_status = row.get('identity_status') or 'untracked'
                 point = _finite_pitch(row.get('bbox_pitch'))
                 inside = point is not None and abs(point['pitch_x']) <= 52.5 and abs(point['pitch_y']) <= 34
                 is_outside = point is not None and not inside
@@ -114,7 +123,9 @@ def clean_review(run, output):
                 cv2.rectangle(canvas, a,b,color,1)
                 # Border-truncated boxes remain visible; they are not reliable foot positions.
                 truncated = l <= 0 or t <= 0 or l+bw >= raw.shape[1]-1 or t+bh >= raw.shape[0]-1
-                label = str(track) if track is not None else '?'
+                status_tag = {'stable': '', 'reconnected': ' R', 'new_after_gap': ' N',
+                              'split_on_jump': ' S'}.get(identity_status, ' ?')
+                label = (str(track) + status_tag) if track is not None else '?'
                 if is_outside:
                     label = 'OUT '+label
                 if truncated:
@@ -136,7 +147,9 @@ def clean_review(run, output):
                     continue
                 mapped += 1
                 native = (point['pitch_x'],point['pitch_y'])
-                history = histories.setdefault(track,deque())
+                # Identity IDs are only meaningful within a camera segment.
+                segment_id = decisions.get(image_id, {}).get('segment_id')
+                history = histories.setdefault((segment_id, track), deque())
                 trail = trail_points(history,int(image.frame),native,max(2,round(fps*.4)))
                 if len(trail)>1:
                     cv2.polylines(canvas,[np.array([pitch_point(*p) for p in trail],dtype=np.int32)],False,tuple(v//2 for v in color),1,cv2.LINE_AA)
@@ -156,10 +169,11 @@ def clean_review(run, output):
                                      f'{unavailable} missing projections',
                                      'Outside points remain in the JSON.',
                                      'Trails show 0.4 s of observed positions.',
+                                     'ID tags: R reconnected | N new after gap | S split jump.',
                                      'Identity and calibration are unverified.']):
                 text(canvas,line,(1338,640+i*32),.55)
             text(canvas, f'Frame {sequence+1} / {len(images)}   |   * Box touches image border', (24,835),.65)
-            text(canvas, 'Track IDs can change after occlusion or leaving the image. No positions are filled across gaps.', (24,871),.52)
+            text(canvas, 'Reconnect requires ReID + feasible pitch motion; no positions are filled across gaps.', (24,871),.52)
             writer.write(canvas)
             if sequence in {0,len(images)//4,len(images)//2,3*len(images)//4,len(images)-1}:
                 cv2.imwrite(str(output/f'frame_{int(image.frame):03d}.jpg'),canvas)
@@ -169,6 +183,8 @@ def clean_review(run, output):
     raw_video.unlink()
     metadata.update(review_layout='clean',review_width=1920,review_height=900,
                     minimap_filter='tracked, finite, inside canonical pitch; raw JSON retained',
-                    trails='0.4 s, reset on gaps or >3 m consecutive displacement')
+                    trails='0.4 s, reset on gaps or >3 m consecutive displacement',
+                    identity_summary=identity_summary,
+                    identity_tags='R=reconnected, N=new_after_gap, S=split_on_jump')
     (output/'review_summary.json').write_text(json.dumps(metadata,indent=2))
     print(json.dumps(metadata,indent=2))

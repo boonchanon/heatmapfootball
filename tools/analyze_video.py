@@ -18,7 +18,9 @@ def main():
                         default=Path(__file__).resolve().parents[1] / 'pretrained_models')
     parser.add_argument('--stage', choices=STAGES, default='calibrate')
     parser.add_argument('--max-frames', type=int,
-                        help='Process only the first contiguous real frames')
+                        help='Process a contiguous original-frame segment')
+    parser.add_argument('--start-seconds', type=float, default=0,
+                        help='Start analysis at this video time (default: 0)')
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     parser.add_argument('--check-environment', action='store_true')
     args = parser.parse_args()
@@ -28,10 +30,12 @@ def main():
         return 0 if report['ready_for_import_check'] else 2
     if args.video is None:
         parser.error('--video is required unless --check-environment is used')
+    if not __import__('math').isfinite(args.start_seconds) or args.start_seconds < 0:
+        parser.error('--start-seconds must be a finite number greater than or equal to zero')
     output = args.output or Path('outputs') / args.video.stem
     try:
         evidence = run_video(args.video, output, args.model_dir, args.stage, args.device,
-                     args.max_frames)
+                     args.max_frames, args.start_seconds)
     except Exception as error:
         print(f'Inference failed: {type(error).__name__}: {error}', file=sys.stderr)
         return 1

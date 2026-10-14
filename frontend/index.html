@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Pitchside — วิเคราะห์วิดีโอฟุตบอล</title>
+  <style>
+    *{box-sizing:border-box} body{margin:0;background:#0d181a;color:#ecf5ef;font:16px system-ui,sans-serif} main{max-width:940px;margin:auto;padding:42px 22px} h1{font-size:34px;margin:0} p{color:#b9cbc4;line-height:1.6}.box{background:#172728;border:1px solid #294340;border-radius:14px;padding:24px;margin:22px 0}.row{display:flex;gap:18px;align-items:end;flex-wrap:wrap}label{display:grid;gap:7px;color:#cfe2d9;font-size:14px}input,select,button{font:inherit;color:inherit;background:#102022;border:1px solid #54746a;border-radius:7px;padding:10px}input[type=file]{max-width:420px}button{background:#21805e;border:0;font-weight:700;cursor:pointer;padding:11px 20px}.status{border-left:4px solid #67dcb0}.failed{border-color:#ff8d76}iframe{width:100%;height:920px;border:0;border-radius:12px;background:#10191c}pre{white-space:pre-wrap;background:#0c1415;padding:12px;border-radius:7px;max-height:220px;overflow:auto}.hidden{display:none}.hint{font-size:13px}@media(max-width:650px){main{padding:24px 14px}h1{font-size:27px}iframe{height:1050px}}
+  </style>
+  <script src="/config.js"></script>
+</head>
+<body><main>
+  <header><h1>Pitchside วิเคราะห์วิดีโอฟุตบอล</h1><p>อัปโหลดคลิป → ติดตามผู้เล่น → สร้างวิดีโอและ heatmap</p></header>
+  <section class="box"><label>URL ของ Local API ผ่าน Cloudflare Tunnel<input id="api-url" type="url" placeholder="https://api.example.com" required></label><p class="hint">ตั้งครั้งแรกต่อเบราว์เซอร์เท่านั้น · URL นี้เป็นข้อมูลสาธารณะ ไม่ใส่ token หรือรหัสผ่าน</p></section>
+  <section class="box"><form id="upload"><div class="row"><label>วิดีโอฟุตบอล<input name="video" type="file" accept="video/mp4,video/quicktime,video/x-msvideo,video/x-matroska,.mp4,.mov,.avi,.mkv" required></label><label>โหมด<select name="stage"><option value="mvp">MVP</option><option value="calibrate">Calibrate</option><option value="full">Full</option></select></label><label>อุปกรณ์<select name="device"><option value="auto">Auto</option><option value="cuda">CUDA</option><option value="cpu">CPU</option></select></label><label>จำนวนเฟรม<input name="max_frames" type="number" min="1" max="3600" placeholder="1800"></label><button>อัปโหลดและเริ่ม</button></div></form><p class="hint">Cloudflare Free รับไฟล์อัปโหลดได้ไม่เกิน 100 MB</p></section>
+  <section id="progress" class="box status hidden"><b id="phase"></b><p id="detail"></p><pre id="error" class="hidden"></pre></section>
+  <section id="results" class="hidden"><h2>ผลลัพธ์</h2><p><a id="review" target="_blank" rel="noopener">เปิดวิดีโอผลลัพธ์</a></p><iframe id="heatmap" title="Heatmap result"></iframe></section>
+</main><script>
+const $=s=>document.querySelector(s),form=$('#upload'),apiInput=$('#api-url'),progress=$('#progress'),phase=$('#phase'),detail=$('#detail'),error=$('#error'),results=$('#results');let timer;
+apiInput.value=window.PITCHSIDE_API_URL||localStorage.getItem('pitchside-api-url')||'';
+function apiBase(){const value=apiInput.value.trim().replace(/\/$/,'');if(!/^https:\/\/[^/]+/.test(value))throw new Error('กรุณาใส่ HTTPS URL ของ Cloudflare Tunnel');localStorage.setItem('pitchside-api-url',value);return value}
+function absolute(path){return new URL(path,apiBase()+'/').href}
+async function json(response){const data=await response.json().catch(()=>({error:'API ส่งข้อมูลกลับมาไม่ถูกต้อง'}));if(!response.ok)throw new Error(data.error||'คำขอล้มเหลว');return data}
+form.onsubmit=async event=>{event.preventDefault();const button=form.querySelector('button');button.disabled=true;progress.className='box status';error.classList.add('hidden');detail.textContent='กำลังอัปโหลด…';try{const data=await json(await fetch(absolute('/api/jobs'),{method:'POST',body:new FormData(form)}));poll(data.id)}catch(err){progress.classList.add('failed');error.textContent=err.message;error.classList.remove('hidden');button.disabled=false}};
+function poll(id){timer=setInterval(async()=>{try{const data=await json(await fetch(absolute('/api/jobs/'+id)));phase.textContent=data.phase;detail.textContent=data.detail;if(data.status==='failed'){clearInterval(timer);progress.classList.add('failed');error.textContent=(data.error_detail||'ไม่มีรายละเอียด')+'\n\nดู log: '+absolute(data.log||'/');error.classList.remove('hidden');form.querySelector('button').disabled=false}if(data.status==='complete'){clearInterval(timer);results.classList.remove('hidden');$('#review').href=absolute(data.review);$('#heatmap').src=absolute(data.result);form.querySelector('button').disabled=false}}catch(err){clearInterval(timer);progress.classList.add('failed');error.textContent=err.message;error.classList.remove('hidden');form.querySelector('button').disabled=false}},1500)}
+</script></body></html>

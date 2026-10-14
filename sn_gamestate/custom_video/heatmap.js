@@ -1,6 +1,7 @@
 /* Shared, model-free occupancy math used by the page and Node regression checks. */
 function selectSamples(data, options) {
   return data.samples.filter(p => p[2] >= options.start && p[2] < options.end &&
+    (!options.scene || options.scene === 'all' || String(p[6]) === options.scene) &&
     (options.track === 'all' || String(p[4]) === options.track) &&
     (!options.excludeTruncated || !p[5]));
 }

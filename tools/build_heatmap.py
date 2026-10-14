@@ -8,20 +8,37 @@ from pathlib import Path
 from urllib.parse import quote
 
 
+def track_option_id(value):
+    """Use the same canonical ID in selector options and heatmap samples."""
+    if isinstance(value, (float, int)) and int(value) == value:
+        return str(int(value))
+    return str(value)
+
+
 def prepare_data(tracking):
     fps = float(tracking['video']['fps'])
-    duration = float(tracking['processing']['processed_duration_seconds'])
-    if not math.isfinite(fps) or fps <= 0 or not math.isfinite(duration) or duration <= 0:
+    processing = tracking['processing']
+    start_frame = int(processing.get('start_frame', processing.get('first_frame', 0) or 0))
+    processed_duration = float(processing['processed_duration_seconds'])
+    fallback_end = (processing.get('last_frame') + 1 if processing.get('last_frame') is not None
+                    else start_frame + round(processed_duration * fps))
+    end_frame = int(processing.get('end_frame', fallback_end))
+    segment_start = start_frame / fps
+    segment_end = end_frame / fps
+    duration = segment_end
+    if not math.isfinite(fps) or fps <= 0 or not math.isfinite(duration) or segment_end <= segment_start:
         raise ValueError('Expected a positive finite FPS and analyzed duration')
     samples, tracks, seen = [], [], set()
     excluded = 0
     for player in tracking['players']:
         value = player['track_id']
-        track = str(int(value)) if isinstance(value, (float, int)) and int(value) == value else str(value)
+        segment = player.get('segment_id')
+        track_value = track_option_id(value)
+        track = f'{segment}/{track_value}' if segment else track_value
         tracks.append(track)
         for point in player['positions']:
             x, y = point.get('pitch_x'), point.get('pitch_y')
-            if x is None or y is None or not all(math.isfinite(v) for v in (x,y)) or abs(x)>52.5 or abs(y)>34:
+            if not point.get('usable_for_heatmap', True) or x is None or y is None or not all(math.isfinite(v) for v in (x,y)) or abs(x)>52.5 or abs(y)>34:
                 excluded += 1
                 continue
             frame, time = int(point['frame']), float(point['time'])
@@ -32,9 +49,35 @@ def prepare_data(tracking):
             if (track,frame) in seen:
                 raise ValueError('Duplicate track/frame would double-count occupancy')
             seen.add((track,frame))
-            samples.append([x,y,time,frame,track,point.get('bbox_truncated') is not False])
-    return {'fps':fps,'duration':duration,'name':tracking['video']['name'],
+            samples.append([x,y,time,frame,track_value,point.get('bbox_truncated') is not False,segment or 'segment_001'])
+    scenes = {}
+    track_options = []
+    for player in tracking['players']:
+        scene = player.get('segment_id') or 'segment_001'
+        positions = player.get('positions', [])
+        times = [float(point['time']) for point in positions if isinstance(point.get('time'), (int, float)) and math.isfinite(point['time'])]
+        if not times:
+            continue
+        scenes.setdefault(scene, {'id': scene, 'start': min(times), 'end': max(times)})
+        track_options.append({'scene': scene, 'id': track_option_id(player['track_id']),
+                              'start': min(times), 'end': max(times), 'frames': len(positions)})
+    # New exports include all segments, including a shot where no player was
+    # tracked.  Prefer that authoritative timeline over inferring it from
+    # player positions, which can truncate a scene label in the UI.
+    exported_scenes = tracking.get('scenes')
+    if isinstance(exported_scenes, list):
+        scene_options = [
+            {'id': scene['segment_id'], 'start': float(scene['start_time']),
+             'end': float(scene['end_time']), 'start_reason': scene.get('start_reason')}
+            for scene in exported_scenes
+            if isinstance(scene, dict) and scene.get('segment_id')
+        ]
+    else:
+        scene_options = list(scenes.values())
+    scene_options.sort(key=lambda item: (item['start'], item['id']))
+    return {'fps':fps,'duration':duration,'start_time':segment_start,'name':tracking['video']['name'],
             'tracks':sorted(set(tracks),key=lambda v:(not v.isdigit(),int(v) if v.isdigit() else v)),
+            'scenes':scene_options,'track_options':track_options,
             'samples':samples,'excluded_invalid_or_outside':excluded}
 
 

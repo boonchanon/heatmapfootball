@@ -12,6 +12,8 @@ weights/
 slurm/
 states/
 *..yaml
+test_videos/
+.env.local
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -120,7 +120,48 @@ def summarize_state(detections, images):
     }
 
 
-def run_video(video, output, model_dir, stage='calibrate', device='auto', max_frames=None):
+def select_frame_segment(image_metadatas, video_metadata, start_seconds=0, max_frames=None):
+    """Select original video frame rows without changing their frame identifiers."""
+    try:
+        start_seconds = float(start_seconds)
+    except (TypeError, ValueError):
+        raise ValueError('start_seconds must be a finite number greater than or equal to zero')
+    if not math.isfinite(start_seconds) or start_seconds < 0:
+        raise ValueError('start_seconds must be a finite number greater than or equal to zero')
+    if max_frames is not None and max_frames <= 0:
+        raise ValueError('max_frames must be positive')
+    fps = float(video_metadata['fps'])
+    frame_count = int(video_metadata['frame_count'])
+    start_frame = round(start_seconds * fps)
+    if start_frame < 0 or start_frame >= frame_count:
+        raise ValueError('start_seconds is outside the video duration')
+    end_frame = min(frame_count, start_frame + (max_frames if max_frames is not None else frame_count - start_frame))
+    selected = image_metadatas.iloc[start_frame:end_frame].copy()
+    if selected.empty:
+        raise ValueError('Selected frame range is empty')
+    return selected, start_frame, end_frame
+
+
+def configure_tracking_set_segment(tracking_set, video_metadata, image_folder, video_stem,
+                                   start_seconds=0, max_frames=None):
+    """Synchronize one TrackLab set with an original-frame video segment.
+
+    TrackLab's ReID setup also reads ``dataset.training_sets``.  Therefore the
+    caller must apply this operation to both the active and training set before
+    constructing modules; keeping only the active set in sync loses image_gt's
+    required video_id column in the ReID path.
+    """
+    selected, start_frame, end_frame = select_frame_segment(
+        tracking_set.image_metadatas, video_metadata, start_seconds, max_frames)
+    selected['file_path'] = extracted_frame_paths(image_folder, video_stem, selected.frame)
+    tracking_set.image_metadatas = selected
+    # image_gt is consumed by TrackLab/ReID even for external video input.
+    # Copy the complete metadata schema, including video_id and original ids.
+    tracking_set.image_gt = selected.copy()
+    return start_frame, end_frame
+
+
+def run_video(video, output, model_dir, stage='calibrate', device='auto', max_frames=None, start_seconds=0):
     video = Path(video).expanduser().resolve()
     output = Path(output).expanduser().resolve()
     model_dir = Path(model_dir).expanduser().resolve()
@@ -160,17 +201,15 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
         dataset = ExternalVideo(**OmegaConf.to_container(cfg.dataset, resolve=True))
         image_folder = write_video_images_to_disk(video).resolve()
         tracking_set = dataset.sets['val']
-        if max_frames is not None:
-            if max_frames <= 0:
-                raise ValueError('max_frames must be positive')
-            tracking_set.image_metadatas = tracking_set.image_metadatas.iloc[:max_frames].copy()
-            tracking_set.image_gt = tracking_set.image_metadatas.copy()
+        training_set = dataset.training_sets['val']
         if len(tracking_set.image_metadatas) != video_metadata['frame_count']:
-            if max_frames is None:
-                raise RuntimeError('Frame count changed between metadata scan and TrackLab')
-        tracking_set.image_metadatas['file_path'] = extracted_frame_paths(
-            image_folder, video.stem, tracking_set.image_metadatas.frame)
-        tracking_set.image_gt = tracking_set.image_metadatas.copy()
+            raise RuntimeError('Frame count changed between metadata scan and TrackLab')
+        start_frame, end_frame = configure_tracking_set_segment(
+            tracking_set, video_metadata, image_folder, video.stem, start_seconds, max_frames)
+        training_start, training_end = configure_tracking_set_segment(
+            training_set, video_metadata, image_folder, video.stem, start_seconds, max_frames)
+        if (training_start, training_end) != (start_frame, end_frame):
+            raise RuntimeError('TrackLab training set selected a different frame range')
         modules = [instantiate(cfg.modules[name], device=device, tracking_dataset=dataset)
                    for name in cfg.pipeline]
         pipeline = Pipeline(models=modules)
@@ -182,11 +221,16 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
         evidence = summarize_state(state.detections_pred, state.image_pred)
         from .export import export_tracking
 
-        export_tracking(state.detections_pred, state.image_pred, video_metadata, output)
+        tracking, quality_metadata = export_tracking(
+            state.detections_pred, state.image_pred, video_metadata, output,
+            start_seconds=start_seconds, start_frame=start_frame, end_frame=end_frame)
         # This is run evidence, not frontend tracking export or a fabricated result.
-        evidence.update(video=video_metadata, stage=stage, device=device,
+        evidence.update(video=video_metadata, stage=stage, device=device, start_seconds=start_seconds, start_frame=start_frame, end_frame=end_frame,
                 frames_processed=len(state.image_pred),
-                        environment=environment['versions'])
+                        environment=environment['versions'],
+                        quality_summary=tracking['quality_summary'],
+                        debug_artifacts=['tracking.json', 'metadata.json',
+                                         'rejected_records.json'])
         (output / 'inference_evidence.json').write_text(
             json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False),
             encoding='utf-8')
