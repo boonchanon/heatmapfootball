@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import uuid
+import gc
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -132,7 +133,10 @@ def public_state(job_id):
 
 
 def process_rss_bytes(pid):
-    """Read a process's RSS without requiring an additional deployment dependency."""
+    """Read a process's RSS without requiring an additional deployment dependency.
+
+    Falls back to psutil when /proc is unavailable, e.g. on a Windows host.
+    """
     try:
         for line in Path(f'/proc/{pid}/status').read_text().splitlines():
             if line.startswith('VmRSS:'):
@@ -153,10 +157,20 @@ def log_rss(log, label, pid):
     return rss
 
 
+def log_memory(state, phase):
+    """Log this web server's own RSS without adding a heavyweight runtime dependency."""
+    rss = process_rss_bytes(os.getpid())
+    message = (f'[RAM] phase={phase} rss_mb={rss / 1048576:.1f}' if rss is not None
+               else f'[RAM] phase={phase} rss=unavailable')
+    with Path(state['log_path']).open('a', encoding='utf-8') as log:
+        log.write(message + '\n')
+
+
 def run_command(command, state, label):
     state.update(phase=label, detail='กำลังประมวลผล อาจใช้เวลาหลายนาที…')
     log_path = Path(state['log_path'])
     exceeded = False
+    log_memory(state, f'before:{label}')
     with log_path.open('a', encoding='utf-8') as log:
         log.write(f'\n$ {subprocess.list2cmdline(command)}\n')
         child = subprocess.Popen(command, cwd=ROOT, text=True, stdout=log,
@@ -181,10 +195,13 @@ def run_command(command, state, label):
             time.sleep(.25)
         returncode = child.wait()
         log_rss(log, f'{label} ended', child.pid)
+    log_memory(state, f'after:{label}')
     if returncode:
-        detail = (f'Process RSS exceeded the {MAX_JOB_RSS_BYTES // 1024 // 1024} MiB safety limit'
-                  if exceeded else f'Command exited with code {returncode}: '
-                  f'{subprocess.list2cmdline(command)}')
+        if exceeded:
+            detail = f'Process RSS exceeded the {MAX_JOB_RSS_BYTES // 1024 // 1024} MiB safety limit'
+        else:
+            detail = (log_path.read_text(encoding='utf-8')[-4000:] or
+                      f'คำสั่งจบด้วย exit code {returncode}: {subprocess.list2cmdline(command)}')
         state.update(status='failed', phase='ไม่สำเร็จ', detail='การประมวลผลหยุดด้วยข้อผิดพลาด',
                      error_detail=detail[-4000:])
         return False

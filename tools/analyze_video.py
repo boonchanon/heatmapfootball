@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sn_gamestate.custom_video.runner import STAGES, check_environment, run_video
+from sn_gamestate.custom_video.video import DEFAULT_MAX_FRAMES, MAX_FRAMES
 
 
 def main():
@@ -17,8 +18,8 @@ def main():
     parser.add_argument('--model-dir', type=Path,
                         default=Path(__file__).resolve().parents[1] / 'pretrained_models')
     parser.add_argument('--stage', choices=STAGES, default='calibrate')
-    parser.add_argument('--max-frames', type=int,
-                        help='Process a contiguous original-frame segment')
+    parser.add_argument('--max-frames', type=int, default=DEFAULT_MAX_FRAMES,
+                        help=f'Process a contiguous original-frame segment (default/max: {DEFAULT_MAX_FRAMES})')
     parser.add_argument('--start-seconds', type=float, default=0,
                         help='Start analysis at this video time (default: 0)')
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
@@ -32,6 +33,8 @@ def main():
         parser.error('--video is required unless --check-environment is used')
     if not __import__('math').isfinite(args.start_seconds) or args.start_seconds < 0:
         parser.error('--start-seconds must be a finite number greater than or equal to zero')
+    if not 1 <= args.max_frames <= MAX_FRAMES:
+        parser.error(f'--max-frames must be between 1 and {MAX_FRAMES}')
     output = args.output or Path('outputs') / args.video.stem
     try:
         evidence = run_video(args.video, output, args.model_dir, args.stage, args.device,
