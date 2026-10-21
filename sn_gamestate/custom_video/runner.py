@@ -10,7 +10,8 @@ from contextlib import contextmanager
 from importlib import metadata
 from pathlib import Path
 
-from .video import extracted_frame_paths, inspect_video, stream_resized_frames, validate_max_frames
+from .video import (extracted_frame_paths, inspect_video, resolve_frame_step, stream_resized_frames,
+                    validate_max_frames)
 
 
 STAGES = {
@@ -98,7 +99,8 @@ def build_config(video, output, model_dir, video_metadata, stage):
         cfg.state.save_file = str(output / 'tracker_state.pklz')
         cfg.state.load_file = None
         if stage == 'mvp' and 'hyperparams' in cfg.modules.track.cfg:
-            cfg.modules.track.cfg.hyperparams.frame_rate = video_metadata['fps']
+            # The tracker sees sampled frames, so its motion model needs the analysed rate.
+            cfg.modules.track.cfg.hyperparams.frame_rate = video_metadata.get('analysis_fps', video_metadata['fps'])
         for name in ['pitch', 'calibration']:
             cfg.modules[name].image_width = video_metadata['width']
             cfg.modules[name].image_height = video_metadata['height']
@@ -153,21 +155,29 @@ def resolve_start_frame(video_metadata, start_seconds=0):
     return start_frame
 
 
-def select_frame_segment(image_metadatas, video_metadata, start_seconds=0, max_frames=None):
-    """Select original video frame rows without changing their frame identifiers."""
+def select_frame_segment(image_metadatas, video_metadata, start_seconds=0, max_frames=None, frame_step=1):
+    """Select original video frame rows without changing their frame identifiers.
+
+    ``max_frames`` counts selected rows; with ``frame_step`` > 1 every Nth original
+    frame is selected.  ``end_frame`` is one past the last selected original frame.
+    """
     if max_frames is not None and max_frames <= 0:
         raise ValueError('max_frames must be positive')
+    if frame_step < 1:
+        raise ValueError('frame_step must be at least 1')
     frame_count = int(video_metadata['frame_count'])
     start_frame = resolve_start_frame(video_metadata, start_seconds)
-    end_frame = min(frame_count, start_frame + (max_frames if max_frames is not None else frame_count - start_frame))
-    selected = image_metadatas.iloc[start_frame:end_frame].copy()
+    span = (max_frames * frame_step) if max_frames is not None else frame_count - start_frame
+    stop = min(frame_count, start_frame + span)
+    selected = image_metadatas.iloc[start_frame:stop:frame_step].copy()
     if selected.empty:
         raise ValueError('Selected frame range is empty')
+    end_frame = start_frame + (len(selected) - 1) * frame_step + 1
     return selected, start_frame, end_frame
 
 
 def configure_tracking_set_segment(tracking_set, video_metadata, image_folder, video_stem,
-                                   start_seconds=0, max_frames=None):
+                                   start_seconds=0, max_frames=None, frame_step=1):
     """Synchronize one TrackLab set with an original-frame video segment.
 
     TrackLab's ReID setup also reads ``dataset.training_sets``.  Therefore the
@@ -176,7 +186,7 @@ def configure_tracking_set_segment(tracking_set, video_metadata, image_folder, v
     required video_id column in the ReID path.
     """
     selected, start_frame, end_frame = select_frame_segment(
-        tracking_set.image_metadatas, video_metadata, start_seconds, max_frames)
+        tracking_set.image_metadatas, video_metadata, start_seconds, max_frames, frame_step)
     selected['file_path'] = extracted_frame_paths(image_folder, video_stem, selected.frame)
     tracking_set.image_metadatas = selected
     # image_gt is consumed by TrackLab/ReID even for external video input.
@@ -185,7 +195,8 @@ def configure_tracking_set_segment(tracking_set, video_metadata, image_folder, v
     return start_frame, end_frame
 
 
-def run_video(video, output, model_dir, stage='calibrate', device='auto', max_frames=None, start_seconds=0):
+def run_video(video, output, model_dir, stage='calibrate', device='auto', max_frames=None, start_seconds=0,
+              sample_fps=None):
     video = Path(video).expanduser().resolve()
     output = Path(output).expanduser().resolve()
     model_dir = Path(model_dir).expanduser().resolve()
@@ -195,6 +206,8 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
         raise ValueError(f'Unknown device: {device}')
     max_frames = validate_max_frames(max_frames)
     video_metadata = inspect_video(video)
+    frame_step = resolve_frame_step(video_metadata['fps'], sample_fps)
+    analysis_fps = video_metadata['fps'] / frame_step
     environment = check_environment(require_optional=stage != 'mvp')
     if environment['errors']:
         raise RuntimeError('\n'.join(environment['errors']))
@@ -224,15 +237,17 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
         memory_checkpoint('before_decode')
         # Decode sequentially and cap/resize before any model sees a frame.
         streamed = stream_resized_frames(video, frame_cache, max_frames=max_frames,
-                                         start_frame=start_frame)
+                                         start_frame=start_frame, frame_step=frame_step)
         memory_checkpoint('after_decode')
         # Pitch/calibration need the resized dims; frame_count/fps stay the source
         # video's, so start_seconds keeps meaning the original timeline below.
-        resized_metadata = dict(video_metadata, width=streamed['width'], height=streamed['height'])
+        resized_metadata = dict(video_metadata, width=streamed['width'], height=streamed['height'],
+                                analysis_fps=analysis_fps)
         cfg = build_config(video, output, model_dir, resized_metadata, stage)
         with working_directory(output):
             OmegaConf.save(cfg, output / 'resolved_config.yaml')
-            print(f'Running stage={stage}, device={device}, output={output}', flush=True)
+            print(f'Running stage={stage}, device={device}, frame_step={frame_step} '
+                  f'({analysis_fps:.2f} analysed frames/s), output={output}', flush=True)
             dataset = ExternalVideo(**OmegaConf.to_container(cfg.dataset, resolve=True))
             image_folder = frame_cache
             tracking_set = dataset.sets['val']
@@ -241,10 +256,10 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
                 raise RuntimeError('Frame count changed between metadata scan and TrackLab')
             segment = configure_tracking_set_segment(
                 tracking_set, video_metadata, image_folder, video.stem, start_seconds,
-                streamed['frame_count'])
+                streamed['frame_count'], frame_step)
             training_segment = configure_tracking_set_segment(
                 training_set, video_metadata, image_folder, video.stem, start_seconds,
-                streamed['frame_count'])
+                streamed['frame_count'], frame_step)
             if segment != (streamed['start_frame'], streamed['end_frame']):
                 raise RuntimeError('Streamed frame range does not match the TrackLab segment')
             if training_segment != segment:
@@ -269,7 +284,10 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
             # This is run evidence, not frontend tracking export or a fabricated result.
             evidence.update(video=video_metadata, stage=stage, device=device,
                     start_seconds=start_seconds, start_frame=start_frame, end_frame=end_frame,
-                    frames_processed=len(state.image_pred),
+                    frames_processed=len(state.image_pred), frame_step=frame_step,
+                    analysis_fps=analysis_fps,
+                    # Detector boxes are in these (resized) pixel coordinates.
+                    analysis_width=streamed['width'], analysis_height=streamed['height'],
                             environment=environment['versions'],
                             quality_summary=tracking['quality_summary'],
                             debug_artifacts=['tracking.json', 'metadata.json',

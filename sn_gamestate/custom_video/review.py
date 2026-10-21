@@ -37,9 +37,12 @@ def track_color(track):
     return tuple(round(v * 255) for v in rgb[::-1])
 
 
-def trail_points(history, frame, point, max_points):
-    """Clear at gaps or very large jumps; never draw a bridge across missing data."""
-    if history and (history[-1][0] != frame - 1
+def trail_points(history, frame, point, max_points, frame_step=1):
+    """Clear at gaps or very large jumps; never draw a bridge across missing data.
+
+    With frame sampling, consecutive analysed frames are ``frame_step`` apart.
+    """
+    if history and (frame - history[-1][0] != frame_step
                     or np.linalg.norm(np.array(point) - history[-1][1]) > 3.):
         history.clear()
     history.append((frame, point))
@@ -63,13 +66,20 @@ def clean_review(run, output, video_path):
          for index, value in decisions.items()})
     _, metadata = export_tracking(detections, images, video, output)
     fps = video['fps']
-    duration = len(images) / fps
+    frame_step = int(evidence.get('frame_step') or 1)
+    analysis_fps = fps / frame_step
+    first_frame = int(images.frame.iloc[0]) if len(images) else 0
+    # Frames were resized (max 1280 px wide) before detection, so boxes must be scaled
+    # back to the source frame.  Older evidence lacks analysis_width: use the same rule.
+    analysis_width = float(evidence.get('analysis_width') or min(video['width'], 1280))
+    duration = (len(images) * frame_step) / fps
     raw_video = output / 'review_raw.mp4'
     browser_video = output / 'review.mp4'
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f'Cannot open source video for review: {video_path}')
-    writer = cv2.VideoWriter(str(raw_video), cv2.VideoWriter_fourcc(*'mp4v'), fps, (1920, 900))
+    # One output frame per analysed frame, played at the analysed rate so time stays real.
+    writer = cv2.VideoWriter(str(raw_video), cv2.VideoWriter_fourcc(*'mp4v'), analysis_fps, (1920, 900))
     if not writer.isOpened():
         raise RuntimeError('Cannot open MP4 encoder')
     histories = {}
@@ -77,13 +87,23 @@ def clean_review(run, output, video_path):
         cv2.putText(canvas, value, point, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
     def pitch_point(x, y):
         return round(1598 + x * 5), round(410 + y * 5)
+    position = 0  # index of the next frame capture.read() returns
     try:
         for sequence, (image_id, image) in enumerate(images.iterrows()):
+            # Seek to the analysed frame's original index; the segment may start after
+            # frame 0 (start_seconds) and frames may be sampled.
+            target = int(image.frame)
+            while position < target:
+                if not capture.grab():
+                    raise ValueError(f'Cannot decode source frame {position}')
+                position += 1
             ok, raw = capture.read()
+            position += 1
             if not ok:
-                raise ValueError(f'Cannot decode source frame {sequence}')
+                raise ValueError(f'Cannot decode source frame {target}')
             if raw.shape[1] > video['width']:
                 raw = cv2.resize(raw, (video['width'], video['height']), interpolation=cv2.INTER_AREA)
+            box_scale = raw.shape[1] / analysis_width
             canvas = np.full((900, 1920, 3), (23, 21, 18), dtype=np.uint8)
             # Fit without distortion, including videos that are not 16:9.
             scale = min(1280/raw.shape[1], 720/raw.shape[0])
@@ -91,7 +111,7 @@ def clean_review(run, output, video_path):
             ox, oy = (1280-w)//2, 80+(720-h)//2
             canvas[oy:oy+h, ox:ox+w] = cv2.resize(raw, (w, h))
             text(canvas, 'MATCH REVIEW', (24, 43), 1., thickness=2)
-            text(canvas, f'{sequence/fps:05.2f} / {duration:.2f} s', (1010, 43), .8)
+            text(canvas, f'{(target - first_frame)/fps:05.2f} / {duration:.2f} s', (1010, 43), .8)
             text(canvas, 'FIELD VIEW', (1338, 110), .95, thickness=2)
             text(canvas, 'Colors identify stable identities, not teams', (1338, 145), .55)
             cv2.rectangle(canvas, pitch_point(-52.5, -34), pitch_point(52.5, 34), (43, 76, 42), -1)
@@ -122,7 +142,7 @@ def clean_review(run, output, video_path):
                 untracked += int(track is None)
                 unavailable += int(point is None)
                 color = track_color(track) if track is not None and inside else (150, 150, 150)
-                l,t,bw,bh = map(float,row.bbox_ltwh)
+                l,t,bw,bh = (float(value) * box_scale for value in row.bbox_ltwh)
                 a = (round(ox+l*scale),round(oy+t*scale))
                 b = (round(ox+(l+bw)*scale),round(oy+(t+bh)*scale))
                 cv2.rectangle(canvas, a,b,color,1)
@@ -155,7 +175,7 @@ def clean_review(run, output, video_path):
                 # Identity IDs are only meaningful within a camera segment.
                 segment_id = decisions.get(image_id, {}).get('segment_id')
                 history = histories.setdefault((segment_id, track), deque())
-                trail = trail_points(history,int(image.frame),native,max(2,round(fps*.4)))
+                trail = trail_points(history,int(image.frame),native,max(2,round(analysis_fps*.4)),frame_step)
                 if len(trail)>1:
                     cv2.polylines(canvas,[np.array([pitch_point(*p) for p in trail],dtype=np.int32)],False,tuple(v//2 for v in color),1,cv2.LINE_AA)
                 pos = pitch_point(*native)

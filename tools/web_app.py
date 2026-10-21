@@ -36,16 +36,20 @@ MODEL_DIR = Path(os.environ.get('MODEL_DIR', ROOT / 'pretrained_models')).resolv
 if 'MAX_JOB_MB' in os.environ:
     MAX_UPLOAD_BYTES = int(os.environ['MAX_JOB_MB']) * 1024 * 1024
 else:
-    MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', str(2 * 1024 * 1024 * 1024)))
+    # A 45-minute 1080p broadcast clip is typically 1-4 GB.
+    MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', str(4 * 1024 * 1024 * 1024)))
 if MAX_UPLOAD_BYTES <= 0:
     raise ValueError('MAX_JOB_MB or MAX_UPLOAD_BYTES must be greater than zero')
-# A one/two-minute verification run at common broadcast frame rates needs more
-# than the old smoke-test ceiling of 250 frames. Operators can lower this for
-# constrained deployments without changing code.
-MAX_FRAMES = int(os.environ.get('MAX_ANALYSIS_FRAMES', '7200'))
+# Counts *analysed* frames (after sampling). 15000 covers a 50-minute half at 5
+# sampled frames/s. Must match sn_gamestate.custom_video.video's default.
+# Operators can lower this for constrained deployments without changing code.
+MAX_FRAMES = int(os.environ.get('MAX_ANALYSIS_FRAMES', '15000'))
 if MAX_FRAMES <= 0:
     raise ValueError('MAX_ANALYSIS_FRAMES must be greater than zero')
-MAX_JOB_RSS_BYTES = int(os.environ.get('MAX_JOB_RSS_MB', '380')) * 1024 * 1024
+# Memory limit for the whole analysis process tree. The default suits a local
+# workstation; small hosts (render.yaml) set it explicitly, e.g. 380.
+MAX_JOB_RSS_BYTES = int(os.environ.get('MAX_JOB_RSS_MB', '12000')) * 1024 * 1024
+MAX_SAMPLE_FPS = 60
 ALLOWED_SUFFIXES = {'.mp4', '.mov', '.avi', '.mkv'}
 # Comma-separated browser origins that may call this API.  Set this to the
 # production Vercel URL before publishing the tunnel.  It intentionally has no
@@ -218,21 +222,33 @@ def public_state(job_id):
 
 
 def process_rss_bytes(pid):
-    """Read a process's RSS without requiring an additional deployment dependency.
+    """RSS of a process *and its children*.
 
-    Falls back to psutil when /proc is unavailable, e.g. on a Windows host.
+    On Windows a venv's python.exe is a small launcher that runs the real
+    interpreter as a child, so measuring only ``pid`` reports a few MB and the
+    memory guard never fires.  psutil walks the tree; /proc is the fallback.
     """
+    try:
+        import psutil
+        root = psutil.Process(pid)
+        total = root.memory_info().rss
+        for child in root.children(recursive=True):
+            try:
+                total += child.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return total
+    except ImportError:
+        pass
+    except Exception:
+        return None
     try:
         for line in Path(f'/proc/{pid}/status').read_text().splitlines():
             if line.startswith('VmRSS:'):
                 return int(line.split()[1]) * 1024
     except (FileNotFoundError, OSError, ValueError, IndexError):
         pass
-    try:
-        import psutil
-        return psutil.Process(pid).memory_info().rss
-    except Exception:
-        return None
+    return None
 
 
 def log_rss(log, label, pid):
@@ -293,7 +309,7 @@ def run_command(command, state, label):
     return True
 
 
-def process(job_id, stage, device, max_frames, start_seconds):
+def process(job_id, stage, device, max_frames, start_seconds, sample_fps=None):
     paths = job_paths(job_id)
     with LOCK:
         state = STATE[job_id]
@@ -306,6 +322,8 @@ def process(job_id, stage, device, max_frames, start_seconds):
                        '--stage', stage, '--device', device, '--start-seconds', str(start_seconds)]
             if max_frames:
                 command += ['--max-frames', str(max_frames)]
+            if sample_fps:
+                command += ['--sample-fps', str(sample_fps)]
             if not run_command(command, state, 'ตรวจจับและติดตามผู้เล่น'):
                 return
             evidence_path = paths['run'] / 'inference_evidence.json'
@@ -313,6 +331,9 @@ def process(job_id, stage, device, max_frames, start_seconds):
                 evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
                 state.update(start_seconds=evidence['start_seconds'], start_frame=evidence['start_frame'],
                              end_frame=evidence['end_frame'], frames_processed=evidence['frames_processed'],
+                             frame_step=evidence.get('frame_step', 1), analysis_fps=evidence.get('analysis_fps'),
+                             video_fps=(evidence.get('video') or {}).get('fps'),
+                             video_duration_seconds=(evidence.get('video') or {}).get('duration_seconds'),
                              quality_summary=evidence.get('quality_summary', {}))
             if not run_command([sys.executable, 'tools/review_coordinates.py', '--run', str(paths['run']),
                                 '--output', str(paths['review']), '--clean'], state, 'สร้างวิดีโอผลลัพธ์'):
@@ -435,6 +456,10 @@ class App(BaseHTTPRequestHandler):
         except ValueError: self.send_json({'error': 'start_seconds must be a number'}, 400); return
         if not math.isfinite(start_seconds) or start_seconds < 0:
             self.send_json({'error': 'start_seconds must be finite and greater than or equal to zero'}, 400); return
+        try: sample_fps = float(form.getfirst('sample_fps') or 0) or None
+        except ValueError: self.send_json({'error': 'sample_fps ต้องเป็นตัวเลข'}, 400); return
+        if sample_fps is not None and not (math.isfinite(sample_fps) and 0 < sample_fps <= MAX_SAMPLE_FPS):
+            self.send_json({'error': f'sample_fps ต้องอยู่ระหว่าง 0-{MAX_SAMPLE_FPS}'}, 400); return
         try: max_frames = int(form.getfirst('max_frames') or MAX_FRAMES)
         except ValueError: self.send_json({'error': 'จำนวนเฟรมต้องเป็นตัวเลข'}, 400); return
         if not 1 <= max_frames <= MAX_FRAMES:
@@ -446,10 +471,10 @@ class App(BaseHTTPRequestHandler):
                 'id': job_id, 'status': 'queued', 'phase': 'รอคิว', 'detail': 'กำลังเตรียมงาน…',
                 'log_path': str(paths['folder'] / 'pipeline.log'),
                 'log': f'/jobs/{job_id}/pipeline.log', 'start_seconds': start_seconds,
-                'max_frames': max_frames, 'stage': stage, 'device': device,
+                'max_frames': max_frames, 'sample_fps': sample_fps, 'stage': stage, 'device': device,
                 'filename': Path(upload.filename or '').name, 'size_bytes': paths['upload'].stat().st_size,
                 'created_at': time.time()})
-        threading.Thread(target=process, args=(job_id, stage, device, max_frames, start_seconds), daemon=True).start()
+        threading.Thread(target=process, args=(job_id, stage, device, max_frames, start_seconds, sample_fps), daemon=True).start()
         self.send_json({'id': job_id}, HTTPStatus.ACCEPTED)
 
 
