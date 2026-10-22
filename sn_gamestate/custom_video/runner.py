@@ -24,6 +24,46 @@ STAGES = {
 }
 
 
+def write_progress(path, **values):
+    """Atomically write a small progress.json the web service polls for its % display."""
+    path = Path(path)
+    temp = path.with_suffix('.json.tmp')
+    try:
+        temp.write_text(json.dumps(values), encoding='utf-8')
+        os.replace(temp, path)
+    except OSError:
+        pass  # progress is best effort and must never fail a job
+
+
+def make_progress_callback(path, module_count):
+    """TrackLab callback: report module index and batch progress (throttled to ~1/s)."""
+    from tracklab.callbacks import Callback
+    import time
+
+    class ProgressCallback(Callback):
+        def __init__(self):
+            self.module_index, self.step, self.total, self.task, self.last = -1, 0, 0, '', 0.0
+
+        def on_module_start(self, engine, task, dataloader, **kwargs):
+            self.module_index += 1
+            self.task, self.step = task, 0
+            self.total = len(dataloader) if hasattr(dataloader, '__len__') else 0
+            self.report(force=True)
+
+        def on_module_step_end(self, engine, task, batch, detections, **kwargs):
+            self.step += 1
+            self.report()
+
+        def report(self, force=False):
+            now = time.monotonic()
+            if force or now - self.last >= 1:
+                self.last = now
+                write_progress(path, stage='inference', module=self.task, module_index=max(0, self.module_index),
+                               module_count=module_count, step=self.step, total=self.total)
+
+    return ProgressCallback()
+
+
 def memory_checkpoint(phase):
     """Fail safely before the container OOM killer restarts the web service."""
     try:
@@ -237,8 +277,10 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
         memory_checkpoint('before_decode')
         # Decode sequentially and cap/resize before any model sees a frame.
         resize = {} if max_width is None else {'max_width': int(max_width)}
+        write_progress(output / 'progress.json', stage='decode')
         streamed = stream_resized_frames(video, frame_cache, max_frames=max_frames,
                                          start_frame=start_frame, frame_step=frame_step, **resize)
+        write_progress(output / 'progress.json', stage='load_models')
         memory_checkpoint('after_decode')
         # Pitch/calibration need the resized dims; frame_count/fps stay the source
         # video's, so start_seconds keeps meaning the original timeline below.
@@ -271,8 +313,9 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
             pipeline = Pipeline(models=modules)
             state = TrackerState(tracking_set, pipeline=pipeline,
                                  save_file=output / 'tracker_state.pklz')
-            engine = OfflineTrackingEngine(modules=pipeline, tracker_state=state,
-                                           num_workers=0, callbacks={})
+            engine = OfflineTrackingEngine(modules=pipeline, tracker_state=state, num_workers=0,
+                                           callbacks={'progress': make_progress_callback(
+                                               output / 'progress.json', len(cfg.pipeline))})
             memory_checkpoint('before_inference')
             engine.track_dataset()
             memory_checkpoint('after_inference')

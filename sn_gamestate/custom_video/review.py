@@ -150,7 +150,16 @@ def clean_review(run, output, video_path):
         return round(1598 + x * 5), round(410 + y * 5)
     position = 0  # index of the next frame capture.read() returns
     try:
-        for target, sequence, t in plan:
+        progress_file = output / 'progress.json'
+        last_report = -1
+        for done, (target, sequence, t) in enumerate(plan):
+            percent = int(done * 100 / max(1, len(plan)))
+            if percent != last_report:
+                last_report = percent
+                try:
+                    progress_file.write_text(json.dumps({'stage': 'review', 'step': done, 'total': len(plan)}))
+                except OSError:
+                    pass
             image_id, image = analysed[sequence]
             is_analysed = target == analysed_frames[sequence]
             # Seek to the output frame's original index; the segment may start after

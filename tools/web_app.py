@@ -140,9 +140,46 @@ def load_jobs():
         STATE[folder.name] = JobState(folder, state)
 
 
+# Share of the whole job each phase represents (inference dominates the run time).
+PHASE_SPAN = {'decode': (0, 3), 'load_models': (3, 6), 'inference': (6, 88), 'review': (88, 98)}
+
+
+def job_progress(state):
+    """Overall % for a running job, from the progress.json files the pipeline writes."""
+    if state.get('status') == 'complete':
+        return {'percent': 100}
+    if state.get('status') != 'running':
+        return {'percent': 0}
+    if state.get('phase') == 'สร้าง heatmap':
+        return {'percent': 99, 'step': 'heatmap'}
+    paths = job_paths(state['id'])
+    progress = None
+    for candidate in (paths['review'] / 'progress.json', paths['run'] / 'progress.json'):
+        try:
+            progress = json.loads(candidate.read_text(encoding='utf-8'))
+            break
+        except (OSError, json.JSONDecodeError):
+            continue
+    if not progress:
+        return {'percent': 0, 'step': 'starting'}
+    stage = progress.get('stage', 'decode')
+    start, end = PHASE_SPAN.get(stage, (0, 3))
+    fraction = 0.0
+    if stage == 'inference':
+        count = max(1, int(progress.get('module_count') or 1))
+        within = progress['step'] / progress['total'] if progress.get('total') else 0
+        fraction = (int(progress.get('module_index') or 0) + min(1, within)) / count
+    elif stage == 'review' and progress.get('total'):
+        fraction = progress['step'] / progress['total']
+    return {'percent': round(start + (end - start) * min(1.0, fraction), 1), 'step': stage,
+            'module': progress.get('module'), 'module_index': progress.get('module_index'),
+            'module_count': progress.get('module_count')}
+
+
 def job_summary(state):
     summary = {key: value for key, value in state.items() if key not in {'log_path', 'scenes', 'quality_summary'}}
     summary['has_upload'] = (JOBS / state['id'] / 'upload.mp4').exists()
+    summary['progress'] = job_progress(state)
     return summary
 
 
@@ -216,6 +253,7 @@ def public_state(job_id):
     if not state:
         return None
     state.pop('log_path', None)
+    state['progress'] = job_progress(state)
     if state.get('status') == 'complete':
         state['scenes'] = workspace_scenes(job_id)
     return state

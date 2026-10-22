@@ -97,6 +97,20 @@ class WebAppJobsTest(unittest.TestCase):
         self.assertEqual(self.request(f'{base}/api/jobs/444444444444', 'DELETE')[0], 404)
         self.assertEqual(self.request(f'{base}/api/jobs/..%2F..%2Fetc', 'DELETE')[0], 404)
 
+    def test_progress_percent_follows_pipeline_files(self):
+        folder = self.make_job('777777777777')
+        state = {'id': '777777777777', 'status': 'running'}
+        self.assertEqual(self.web_app.job_progress(state)['percent'], 0)
+        (folder / 'run').mkdir()
+        (folder / 'run' / 'progress.json').write_text(json.dumps(
+            {'stage': 'inference', 'module': 'reid', 'module_index': 1, 'module_count': 5, 'step': 5, 'total': 10}))
+        progress = self.web_app.job_progress(state)
+        self.assertAlmostEqual(progress['percent'], 6 + 82 * (1.5 / 5), places=1)
+        self.assertEqual(progress['module'], 'reid')
+        (folder / 'review' / 'progress.json').write_text(json.dumps({'stage': 'review', 'step': 50, 'total': 100}))
+        self.assertEqual(self.web_app.job_progress(state)['percent'], 93)
+        self.assertEqual(self.web_app.job_progress({'id': '777777777777', 'status': 'complete'})['percent'], 100)
+
     def test_service_token_protects_list_and_delete(self):
         os.environ['SERVICE_API_TOKEN'] = 'secret'
         self.web_app = importlib.reload(self.web_app)
