@@ -14,6 +14,11 @@ if MAX_FRAMES <= 0:
     raise ValueError('MAX_ANALYSIS_FRAMES must be greater than zero')
 
 
+# Frames wider than this are downscaled before detection to save RAM. 0 keeps full
+# resolution (best detection of small, distant players); small hosts set 1280.
+ANALYSIS_MAX_WIDTH = int(os.environ.get('ANALYSIS_MAX_WIDTH', '0'))
+
+
 def resolve_frame_step(fps, sample_fps=None):
     """Original frames to advance per analysed frame (1 = analyse every frame)."""
     if sample_fps in (None, 0, '0', ''):
@@ -79,7 +84,7 @@ def validate_max_frames(value):
     return value
 
 
-def stream_resized_frames(video, folder, max_frames=DEFAULT_MAX_FRAMES, max_width=1280,
+def stream_resized_frames(video, folder, max_frames=DEFAULT_MAX_FRAMES, max_width=ANALYSIS_MAX_WIDTH,
                           start_frame=0, frame_step=1):
     """Decode one frame at a time into a *temporary* TrackLab input cache.
 
@@ -127,7 +132,7 @@ def stream_resized_frames(video, folder, max_frames=DEFAULT_MAX_FRAMES, max_widt
             ok, frame = capture.read()
             if not ok:
                 break
-            if frame.shape[1] > max_width:
+            if max_width and frame.shape[1] > max_width:
                 scale = max_width / frame.shape[1]
                 frame = cv2.resize(frame, (max_width, round(frame.shape[0] * scale)),
                                    interpolation=cv2.INTER_AREA)

@@ -125,8 +125,8 @@ def clean_review(run, output, video_path):
     frame_step = int(evidence.get('frame_step') or 1)
     analysis_fps = fps / frame_step
     first_frame = int(images.frame.iloc[0]) if len(images) else 0
-    # Frames were resized (max 1280 px wide) before detection, so boxes must be scaled
-    # back to the source frame.  Older evidence lacks analysis_width: use the same rule.
+    # Frames may have been resized before detection, so boxes must be scaled back to the
+    # source frame.  Older evidence lacks analysis_width: those runs used a 1280 px cap.
     analysis_width = float(evidence.get('analysis_width') or min(video['width'], 1280))
     duration = (len(images) * frame_step) / fps
     raw_video = output / 'review_raw.mp4'
