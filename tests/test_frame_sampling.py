@@ -86,3 +86,40 @@ def test_trails_continue_across_sampled_frames_but_reset_on_real_gaps():
     assert trail_points(history, 10, (.5, 0), 5, frame_step=10) == [(0, 0), (.5, 0)]
     # A missed sampled frame (20 skipped) is a real gap: do not bridge it.
     assert trail_points(history, 30, (1, 0), 5, frame_step=10) == [(1, 0)]
+
+
+def test_review_plan_without_sparse_sampling_is_one_frame_per_analysed_frame():
+    from sn_gamestate.custom_video.review import review_frame_plan
+    plan, fps = review_frame_plan([0, 1, 2], fps=25, frame_step=1, review_fps=25)
+    assert plan == [(0, 0, 0.0), (1, 1, 0.0), (2, 2, 0.0)] and fps == 25
+
+
+def test_review_plan_fills_sampled_gaps_at_review_rate():
+    from sn_gamestate.custom_video.review import review_frame_plan
+    # 50 fps source analysed every 10th frame, reviewed at 25 fps (every 2nd source frame).
+    plan, fps = review_frame_plan([100, 110, 120], fps=50, frame_step=10, review_fps=25)
+    assert fps == 25
+    assert [frame for frame, _, _ in plan] == [100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120]
+    assert plan[2] == (104, 0, 0.4) and plan[5] == (110, 1, 0.0)
+
+
+def test_review_plan_holds_across_real_gaps():
+    from sn_gamestate.custom_video.review import review_frame_plan
+    plan, _ = review_frame_plan([0, 10, 40], fps=50, frame_step=10, review_fps=25)
+    assert all(t == 0.0 for frame, index, t in plan if index == 1)  # 10 -> 40 is a gap: no gliding
+
+
+def test_interpolate_rows_moves_only_matched_identities():
+    from sn_gamestate.custom_video.review import interpolate_rows
+    pitch = lambda x, y: {'x_bottom_middle': x, 'y_bottom_middle': y}
+    a = [{'identity_id': 1, 'bbox_ltwh': [0, 0, 10, 20], 'bbox_pitch': pitch(0, 0)},
+         {'identity_id': 2, 'bbox_ltwh': [50, 50, 10, 20], 'bbox_pitch': pitch(5, 5)},
+         {'identity_id': float('nan'), 'bbox_ltwh': [90, 90, 10, 20], 'bbox_pitch': None}]
+    b = [{'identity_id': 1, 'bbox_ltwh': [10, 20, 10, 20], 'bbox_pitch': pitch(2, 4)},
+         {'identity_id': 3, 'bbox_ltwh': [0, 0, 1, 1], 'bbox_pitch': pitch(9, 9)}]
+    rows = interpolate_rows(a, b, .5)
+    assert list(rows[0]['bbox_ltwh']) == [5, 10, 10, 20]
+    assert rows[0]['bbox_pitch'] == pitch(1, 2)
+    assert rows[1] is a[1] and rows[2] is a[2]  # unmatched rows are held, not moved
+    assert len(rows) == 2 + 1  # identity 3 (only in b) is not drawn early
+    assert a[0]['bbox_ltwh'] == [0, 0, 10, 20]  # inputs untouched
