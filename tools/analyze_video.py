@@ -23,6 +23,9 @@ def main():
     parser.add_argument('--start-seconds', type=float, default=0,
                         help='Start analysis at this video time (default: 0)')
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    parser.add_argument('--max-width', type=int, default=None,
+                        help='Downscale wider frames before detection; 0 = full resolution '
+                             '(default: ANALYSIS_MAX_WIDTH)')
     parser.add_argument('--sample-fps', type=float, default=None,
                         help='Analyse about this many frames per second of video (default: every frame)')
     parser.add_argument('--check-environment', action='store_true')
@@ -37,12 +40,14 @@ def main():
         parser.error('--start-seconds must be a finite number greater than or equal to zero')
     if args.sample_fps is not None and (not __import__('math').isfinite(args.sample_fps) or args.sample_fps <= 0):
         parser.error('--sample-fps must be a positive number')
+    if args.max_width is not None and args.max_width < 0:
+        parser.error('--max-width must be 0 or a positive number of pixels')
     if not 1 <= args.max_frames <= MAX_FRAMES:
         parser.error(f'--max-frames must be between 1 and {MAX_FRAMES}')
     output = args.output or Path('outputs') / args.video.stem
     try:
         evidence = run_video(args.video, output, args.model_dir, args.stage, args.device,
-                     args.max_frames, args.start_seconds, args.sample_fps)
+                     args.max_frames, args.start_seconds, args.sample_fps, args.max_width)
     except Exception as error:
         print(f'Inference failed: {type(error).__name__}: {error}', file=sys.stderr)
         return 1

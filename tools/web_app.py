@@ -309,7 +309,7 @@ def run_command(command, state, label):
     return True
 
 
-def process(job_id, stage, device, max_frames, start_seconds, sample_fps=None):
+def process(job_id, stage, device, max_frames, start_seconds, sample_fps=None, max_width=None):
     paths = job_paths(job_id)
     with LOCK:
         state = STATE[job_id]
@@ -324,6 +324,8 @@ def process(job_id, stage, device, max_frames, start_seconds, sample_fps=None):
                 command += ['--max-frames', str(max_frames)]
             if sample_fps:
                 command += ['--sample-fps', str(sample_fps)]
+            if max_width is not None:
+                command += ['--max-width', str(max_width)]
             if not run_command(command, state, 'ตรวจจับและติดตามผู้เล่น'):
                 return
             evidence_path = paths['run'] / 'inference_evidence.json'
@@ -460,6 +462,11 @@ class App(BaseHTTPRequestHandler):
         except ValueError: self.send_json({'error': 'sample_fps ต้องเป็นตัวเลข'}, 400); return
         if sample_fps is not None and not (math.isfinite(sample_fps) and 0 < sample_fps <= MAX_SAMPLE_FPS):
             self.send_json({'error': f'sample_fps ต้องอยู่ระหว่าง 0-{MAX_SAMPLE_FPS}'}, 400); return
+        try: max_width = int(form.getfirst('max_width')) if form.getfirst('max_width') not in (None, '') else None
+        except ValueError: self.send_json({'error': 'max_width ต้องเป็นตัวเลข'}, 400); return
+        if max_width is not None and max_width < 0:
+            self.send_json({'error': 'max_width ต้องเป็น 0 หรือมากกว่า'}, 400); return
+        quality = (form.getfirst('quality') or '').strip()[:20]
         try: max_frames = int(form.getfirst('max_frames') or MAX_FRAMES)
         except ValueError: self.send_json({'error': 'จำนวนเฟรมต้องเป็นตัวเลข'}, 400); return
         if not 1 <= max_frames <= MAX_FRAMES:
@@ -471,10 +478,12 @@ class App(BaseHTTPRequestHandler):
                 'id': job_id, 'status': 'queued', 'phase': 'รอคิว', 'detail': 'กำลังเตรียมงาน…',
                 'log_path': str(paths['folder'] / 'pipeline.log'),
                 'log': f'/jobs/{job_id}/pipeline.log', 'start_seconds': start_seconds,
-                'max_frames': max_frames, 'sample_fps': sample_fps, 'stage': stage, 'device': device,
+                'max_frames': max_frames, 'sample_fps': sample_fps, 'max_width': max_width,
+                'quality': quality, 'stage': stage, 'device': device,
                 'filename': Path(upload.filename or '').name, 'size_bytes': paths['upload'].stat().st_size,
                 'created_at': time.time()})
-        threading.Thread(target=process, args=(job_id, stage, device, max_frames, start_seconds, sample_fps), daemon=True).start()
+        threading.Thread(target=process, args=(job_id, stage, device, max_frames, start_seconds, sample_fps, max_width),
+                         daemon=True).start()
         self.send_json({'id': job_id}, HTTPStatus.ACCEPTED)
 
 

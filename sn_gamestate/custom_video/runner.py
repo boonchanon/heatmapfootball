@@ -196,7 +196,7 @@ def configure_tracking_set_segment(tracking_set, video_metadata, image_folder, v
 
 
 def run_video(video, output, model_dir, stage='calibrate', device='auto', max_frames=None, start_seconds=0,
-              sample_fps=None):
+              sample_fps=None, max_width=None):
     video = Path(video).expanduser().resolve()
     output = Path(output).expanduser().resolve()
     model_dir = Path(model_dir).expanduser().resolve()
@@ -236,8 +236,9 @@ def run_video(video, output, model_dir, stage='calibrate', device='auto', max_fr
         start_frame = resolve_start_frame(video_metadata, start_seconds)
         memory_checkpoint('before_decode')
         # Decode sequentially and cap/resize before any model sees a frame.
+        resize = {} if max_width is None else {'max_width': int(max_width)}
         streamed = stream_resized_frames(video, frame_cache, max_frames=max_frames,
-                                         start_frame=start_frame, frame_step=frame_step)
+                                         start_frame=start_frame, frame_step=frame_step, **resize)
         memory_checkpoint('after_decode')
         # Pitch/calibration need the resized dims; frame_count/fps stay the source
         # video's, so start_seconds keeps meaning the original timeline below.
