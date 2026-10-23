@@ -121,7 +121,8 @@ def export_tracking(detections, images, video, output, start_seconds=0, start_fr
         'frames_processed': len(frames),
         'first_frame': frames[0] if frames else None,
         'last_frame': frames[-1] if frames else None,
-        'processed_duration_seconds': len(frames) / float(video['fps']),
+        # Covered video time; with frame sampling this is longer than len(frames) / fps.
+        'processed_duration_seconds': ((frames[-1] - frames[0] + 1) / float(video['fps'])) if frames else 0.0,
         'start_seconds': float(start_seconds),
         'start_frame': int(start_frame),
         'end_frame': int(end_frame) if end_frame is not None else (frames[-1] + 1 if frames else int(start_frame)),

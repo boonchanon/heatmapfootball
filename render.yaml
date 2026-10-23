@@ -17,3 +17,9 @@ services:
         value: "104857600"
       - key: MAX_JOB_RSS_MB
         value: "380"
+      # Small hosted instance: keep the original frame ceiling (local default is 15000).
+      - key: MAX_ANALYSIS_FRAMES
+        value: "7200"
+      # Small hosted instance: downscale frames before detection to save RAM.
+      - key: ANALYSIS_MAX_WIDTH
+        value: "1280"

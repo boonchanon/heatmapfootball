@@ -14,6 +14,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,16 +36,20 @@ MODEL_DIR = Path(os.environ.get('MODEL_DIR', ROOT / 'pretrained_models')).resolv
 if 'MAX_JOB_MB' in os.environ:
     MAX_UPLOAD_BYTES = int(os.environ['MAX_JOB_MB']) * 1024 * 1024
 else:
-    MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', str(2 * 1024 * 1024 * 1024)))
+    # A 45-minute 1080p broadcast clip is typically 1-4 GB.
+    MAX_UPLOAD_BYTES = int(os.environ.get('MAX_UPLOAD_BYTES', str(4 * 1024 * 1024 * 1024)))
 if MAX_UPLOAD_BYTES <= 0:
     raise ValueError('MAX_JOB_MB or MAX_UPLOAD_BYTES must be greater than zero')
-# A one/two-minute verification run at common broadcast frame rates needs more
-# than the old smoke-test ceiling of 250 frames. Operators can lower this for
-# constrained deployments without changing code.
-MAX_FRAMES = int(os.environ.get('MAX_ANALYSIS_FRAMES', '7200'))
+# Counts *analysed* frames (after sampling). 15000 covers a 50-minute half at 5
+# sampled frames/s. Must match sn_gamestate.custom_video.video's default.
+# Operators can lower this for constrained deployments without changing code.
+MAX_FRAMES = int(os.environ.get('MAX_ANALYSIS_FRAMES', '15000'))
 if MAX_FRAMES <= 0:
     raise ValueError('MAX_ANALYSIS_FRAMES must be greater than zero')
-MAX_JOB_RSS_BYTES = int(os.environ.get('MAX_JOB_RSS_MB', '380')) * 1024 * 1024
+# Memory limit for the whole analysis process tree. The default suits a local
+# workstation; small hosts (render.yaml) set it explicitly, e.g. 380.
+MAX_JOB_RSS_BYTES = int(os.environ.get('MAX_JOB_RSS_MB', '12000')) * 1024 * 1024
+MAX_SAMPLE_FPS = 60
 ALLOWED_SUFFIXES = {'.mp4', '.mov', '.avi', '.mkv'}
 # Comma-separated browser origins that may call this API.  Set this to the
 # production Vercel URL before publishing the tunnel.  It intentionally has no
@@ -52,9 +57,130 @@ ALLOWED_SUFFIXES = {'.mp4', '.mov', '.avi', '.mkv'}
 ALLOWED_ORIGINS = {origin.strip().rstrip('/') for origin in
                    os.environ.get('ALLOWED_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(',')
                    if origin.strip()}
+# Optional shared secret for destructive/listing endpoints.  The Next.js proxy sends it in
+# X-Service-Token; leave unset for local-only use.
+SERVICE_TOKEN = os.environ.get('SERVICE_API_TOKEN', '').strip()
+JOB_ID_PATTERN = re.compile(r'^[0-9a-f]{12}$')
+STATE_FILE = 'state.json'
 LOCK = threading.Lock()
 PROCESS_LOCK = threading.Lock()
 STATE = {}
+
+
+class JobState(dict):
+    """Job state that is written to <job>/state.json on every change.
+
+    Keeping it on disk lets the web app list and reopen jobs after this server restarts,
+    instead of losing every job that was only held in memory.
+    """
+
+    def __init__(self, folder, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._folder = Path(folder)
+        self.save()
+
+    def update(self, *args, **kwargs):
+        super().update(*args, **kwargs)
+        self.save()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.save()
+
+    def save(self):
+        super().__setitem__('updated_at', time.time())
+        target = self._folder / STATE_FILE
+        temp = target.with_suffix('.json.tmp')
+        try:
+            temp.write_text(json.dumps(dict(self), ensure_ascii=False), encoding='utf-8')
+            os.replace(temp, target)
+        except OSError as error:
+            print(f'[state] could not save {target}: {error!r}')
+
+
+def legacy_state(folder):
+    """Rebuild a minimal state for jobs created before state.json existed."""
+    job_id = folder.name
+    upload = folder / 'upload.mp4'
+    created_at = upload.stat().st_mtime if upload.exists() else folder.stat().st_mtime
+    complete = (folder / 'heatmap' / 'index.html').exists() and (folder / 'review' / 'review.mp4').exists()
+    state = {'id': job_id, 'created_at': created_at, 'filename': '', 'log': f'/jobs/{job_id}/pipeline.log'}
+    evidence_path = folder / 'run' / 'inference_evidence.json'
+    if evidence_path.exists():
+        try:
+            evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
+            state.update(frames_processed=evidence.get('frames_processed'),
+                         quality_summary=evidence.get('quality_summary', {}))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if complete:
+        state.update(status='complete', phase='เสร็จแล้ว', detail='เปิดดูวิดีโอและ heatmap ได้ด้านล่าง',
+                     result=f'/jobs/{job_id}/heatmap/index.html', review=f'/jobs/{job_id}/review/review.mp4')
+    else:
+        state.update(status='failed', phase='ไม่สำเร็จ', detail='งานนี้ไม่เสร็จหรือไม่มีข้อมูลสถานะ',
+                     error_detail='Job folder has no state.json and no complete results')
+    return state
+
+
+def load_jobs():
+    """Load persisted jobs on startup; jobs that were mid-run cannot resume."""
+    for folder in sorted(JOBS.iterdir()) if JOBS.exists() else []:
+        if not folder.is_dir() or not JOB_ID_PATTERN.match(folder.name):
+            continue
+        try:
+            state = json.loads((folder / STATE_FILE).read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError):
+            state = legacy_state(folder)
+        if state.get('status') in {'queued', 'running'}:
+            state.update(status='failed', phase='ไม่สำเร็จ',
+                         detail='บริการถูกปิดระหว่างประมวลผล กรุณาเริ่มงานใหม่',
+                         error_detail='The analysis service restarted before this job finished')
+        state['id'] = folder.name
+        state['log_path'] = str(folder / 'pipeline.log')
+        STATE[folder.name] = JobState(folder, state)
+
+
+# Share of the whole job each phase represents (inference dominates the run time).
+PHASE_SPAN = {'decode': (0, 3), 'load_models': (3, 6), 'inference': (6, 88), 'review': (88, 98)}
+
+
+def job_progress(state):
+    """Overall % for a running job, from the progress.json files the pipeline writes."""
+    if state.get('status') == 'complete':
+        return {'percent': 100}
+    if state.get('status') != 'running':
+        return {'percent': 0}
+    if state.get('phase') == 'สร้าง heatmap':
+        return {'percent': 99, 'step': 'heatmap'}
+    paths = job_paths(state['id'])
+    progress = None
+    for candidate in (paths['review'] / 'progress.json', paths['run'] / 'progress.json'):
+        try:
+            progress = json.loads(candidate.read_text(encoding='utf-8'))
+            break
+        except (OSError, json.JSONDecodeError):
+            continue
+    if not progress:
+        return {'percent': 0, 'step': 'starting'}
+    stage = progress.get('stage', 'decode')
+    start, end = PHASE_SPAN.get(stage, (0, 3))
+    fraction = 0.0
+    if stage == 'inference':
+        count = max(1, int(progress.get('module_count') or 1))
+        within = progress['step'] / progress['total'] if progress.get('total') else 0
+        fraction = (int(progress.get('module_index') or 0) + min(1, within)) / count
+    elif stage == 'review' and progress.get('total'):
+        fraction = progress['step'] / progress['total']
+    return {'percent': round(start + (end - start) * min(1.0, fraction), 1), 'step': stage,
+            'module': progress.get('module'), 'module_index': progress.get('module_index'),
+            'module_count': progress.get('module_count')}
+
+
+def job_summary(state):
+    summary = {key: value for key, value in state.items() if key not in {'log_path', 'scenes', 'quality_summary'}}
+    summary['has_upload'] = (JOBS / state['id'] / 'upload.mp4').exists()
+    summary['progress'] = job_progress(state)
+    return summary
 
 
 def job_paths(job_id):
@@ -127,27 +253,40 @@ def public_state(job_id):
     if not state:
         return None
     state.pop('log_path', None)
+    state['progress'] = job_progress(state)
     if state.get('status') == 'complete':
         state['scenes'] = workspace_scenes(job_id)
     return state
 
 
 def process_rss_bytes(pid):
-    """Read a process's RSS without requiring an additional deployment dependency.
+    """RSS of a process *and its children*.
 
-    Falls back to psutil when /proc is unavailable, e.g. on a Windows host.
+    On Windows a venv's python.exe is a small launcher that runs the real
+    interpreter as a child, so measuring only ``pid`` reports a few MB and the
+    memory guard never fires.  psutil walks the tree; /proc is the fallback.
     """
+    try:
+        import psutil
+        root = psutil.Process(pid)
+        total = root.memory_info().rss
+        for child in root.children(recursive=True):
+            try:
+                total += child.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return total
+    except ImportError:
+        pass
+    except Exception:
+        return None
     try:
         for line in Path(f'/proc/{pid}/status').read_text().splitlines():
             if line.startswith('VmRSS:'):
                 return int(line.split()[1]) * 1024
     except (FileNotFoundError, OSError, ValueError, IndexError):
         pass
-    try:
-        import psutil
-        return psutil.Process(pid).memory_info().rss
-    except Exception:
-        return None
+    return None
 
 
 def log_rss(log, label, pid):
@@ -203,23 +342,28 @@ def run_command(command, state, label):
             detail = (log_path.read_text(encoding='utf-8')[-4000:] or
                       f'คำสั่งจบด้วย exit code {returncode}: {subprocess.list2cmdline(command)}')
         state.update(status='failed', phase='ไม่สำเร็จ', detail='การประมวลผลหยุดด้วยข้อผิดพลาด',
-                     error_detail=detail[-4000:])
+                     error_detail=detail[-4000:], finished_at=time.time())
         return False
     return True
 
 
-def process(job_id, stage, device, max_frames, start_seconds):
+def process(job_id, stage, device, max_frames, start_seconds, sample_fps=None, max_width=None):
     paths = job_paths(job_id)
     with LOCK:
         state = STATE[job_id]
     with PROCESS_LOCK:
         try:
-            state.update(status='running', phase='กำลังเริ่มงาน', detail='เตรียมโมเดลและวิดีโอ…')
+            state.update(status='running', phase='กำลังเริ่มงาน', detail='เตรียมโมเดลและวิดีโอ…',
+                         started_at=time.time())
             command = [sys.executable, 'tools/analyze_video.py', '--video', str(paths['upload']),
                        '--output', str(paths['run']), '--model-dir', str(MODEL_DIR),
                        '--stage', stage, '--device', device, '--start-seconds', str(start_seconds)]
             if max_frames:
                 command += ['--max-frames', str(max_frames)]
+            if sample_fps:
+                command += ['--sample-fps', str(sample_fps)]
+            if max_width is not None:
+                command += ['--max-width', str(max_width)]
             if not run_command(command, state, 'ตรวจจับและติดตามผู้เล่น'):
                 return
             evidence_path = paths['run'] / 'inference_evidence.json'
@@ -227,6 +371,9 @@ def process(job_id, stage, device, max_frames, start_seconds):
                 evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
                 state.update(start_seconds=evidence['start_seconds'], start_frame=evidence['start_frame'],
                              end_frame=evidence['end_frame'], frames_processed=evidence['frames_processed'],
+                             frame_step=evidence.get('frame_step', 1), analysis_fps=evidence.get('analysis_fps'),
+                             video_fps=(evidence.get('video') or {}).get('fps'),
+                             video_duration_seconds=(evidence.get('video') or {}).get('duration_seconds'),
                              quality_summary=evidence.get('quality_summary', {}))
             if not run_command([sys.executable, 'tools/review_coordinates.py', '--run', str(paths['run']),
                                 '--output', str(paths['review']), '--clean'], state, 'สร้างวิดีโอผลลัพธ์'):
@@ -237,11 +384,12 @@ def process(job_id, stage, device, max_frames, start_seconds):
                 return
             state.update(status='complete', phase='เสร็จแล้ว', detail='เปิดดูวิดีโอและ heatmap ได้ด้านล่าง',
                          result=f'/jobs/{job_id}/heatmap/index.html', review=f'/jobs/{job_id}/review/review.mp4',
-                         log=f'/jobs/{job_id}/pipeline.log')
+                         log=f'/jobs/{job_id}/pipeline.log', finished_at=time.time())
         except Exception as error:
             with Path(state['log_path']).open('a', encoding='utf-8') as log:
                 log.write(f'\nWeb app exception: {error!r}\n')
-            state.update(status='failed', phase='ไม่สำเร็จ', detail='เกิดข้อผิดพลาดในเว็บแอป', error_detail=repr(error))
+            state.update(status='failed', phase='ไม่สำเร็จ', detail='เกิดข้อผิดพลาดในเว็บแอป', error_detail=repr(error),
+                         finished_at=time.time())
         finally:
             gc.collect()
 
@@ -263,8 +411,8 @@ class App(BaseHTTPRequestHandler):
         if origin in ALLOWED_ORIGINS:
             self.send_header('Access-Control-Allow-Origin', origin)
             self.send_header('Vary', 'Origin')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Service-Token')
         super().end_headers()
 
     def do_OPTIONS(self):
@@ -279,8 +427,22 @@ class App(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
 
+    def authorized(self):
+        if SERVICE_TOKEN and self.headers.get('X-Service-Token', '') != SERVICE_TOKEN:
+            self.send_json({'error': 'ไม่มีสิทธิ์เข้าถึง'}, 401)
+            return False
+        return True
+
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == '/api/jobs':
+            if not self.authorized():
+                return
+            with LOCK:
+                items = [job_summary(dict(state)) for state in STATE.values()]
+            items.sort(key=lambda item: item.get('created_at') or 0, reverse=True)
+            self.send_json({'items': items})
+            return
         if parsed.path == '/healthz':
             self.send_json({'status': 'ok'})
             return
@@ -300,6 +462,24 @@ class App(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        job_id = parsed.path.removeprefix('/api/jobs/')
+        if not parsed.path.startswith('/api/jobs/') or not JOB_ID_PATTERN.match(job_id):
+            self.send_json({'error': 'ไม่พบงาน'}, 404); return
+        if not self.authorized():
+            return
+        with LOCK:
+            state = STATE.get(job_id)
+            if state and state.get('status') in {'queued', 'running'}:
+                self.send_json({'error': 'งานกำลังประมวลผลอยู่ ลบไม่ได้'}, 409); return
+            STATE.pop(job_id, None)
+        folder = JOBS / job_id
+        if not state and not folder.exists():
+            self.send_json({'error': 'ไม่พบงาน'}, 404); return
+        shutil.rmtree(folder, ignore_errors=True)
+        self.send_json({'deleted': True, 'id': job_id})
+
     def do_POST(self):
         if self.path != '/api/jobs': self.send_error(404); return
         length = int(self.headers.get('Content-Length', '0'))
@@ -316,6 +496,15 @@ class App(BaseHTTPRequestHandler):
         except ValueError: self.send_json({'error': 'start_seconds must be a number'}, 400); return
         if not math.isfinite(start_seconds) or start_seconds < 0:
             self.send_json({'error': 'start_seconds must be finite and greater than or equal to zero'}, 400); return
+        try: sample_fps = float(form.getfirst('sample_fps') or 0) or None
+        except ValueError: self.send_json({'error': 'sample_fps ต้องเป็นตัวเลข'}, 400); return
+        if sample_fps is not None and not (math.isfinite(sample_fps) and 0 < sample_fps <= MAX_SAMPLE_FPS):
+            self.send_json({'error': f'sample_fps ต้องอยู่ระหว่าง 0-{MAX_SAMPLE_FPS}'}, 400); return
+        try: max_width = int(form.getfirst('max_width')) if form.getfirst('max_width') not in (None, '') else None
+        except ValueError: self.send_json({'error': 'max_width ต้องเป็นตัวเลข'}, 400); return
+        if max_width is not None and max_width < 0:
+            self.send_json({'error': 'max_width ต้องเป็น 0 หรือมากกว่า'}, 400); return
+        quality = (form.getfirst('quality') or '').strip()[:20]
         try: max_frames = int(form.getfirst('max_frames') or MAX_FRAMES)
         except ValueError: self.send_json({'error': 'จำนวนเฟรมต้องเป็นตัวเลข'}, 400); return
         if not 1 <= max_frames <= MAX_FRAMES:
@@ -323,12 +512,16 @@ class App(BaseHTTPRequestHandler):
         job_id = uuid.uuid4().hex[:12]; paths = job_paths(job_id); paths['folder'].mkdir(parents=True)
         with paths['upload'].open('wb') as destination: shutil.copyfileobj(upload.file, destination)
         with LOCK:
-            STATE[job_id] = {'id': job_id, 'status': 'queued', 'phase': 'รอคิว',
-                             'detail': 'กำลังเตรียมงาน…',
-                             'log_path': str(paths['folder'] / 'pipeline.log'),
-                             'log': f'/jobs/{job_id}/pipeline.log', 'start_seconds': start_seconds,
-                             'max_frames': max_frames}
-        threading.Thread(target=process, args=(job_id, stage, device, max_frames, start_seconds), daemon=True).start()
+            STATE[job_id] = JobState(paths['folder'], {
+                'id': job_id, 'status': 'queued', 'phase': 'รอคิว', 'detail': 'กำลังเตรียมงาน…',
+                'log_path': str(paths['folder'] / 'pipeline.log'),
+                'log': f'/jobs/{job_id}/pipeline.log', 'start_seconds': start_seconds,
+                'max_frames': max_frames, 'sample_fps': sample_fps, 'max_width': max_width,
+                'quality': quality, 'stage': stage, 'device': device,
+                'filename': Path(upload.filename or '').name, 'size_bytes': paths['upload'].stat().st_size,
+                'created_at': time.time()})
+        threading.Thread(target=process, args=(job_id, stage, device, max_frames, start_seconds, sample_fps, max_width),
+                         daemon=True).start()
         self.send_json({'id': job_id}, HTTPStatus.ACCEPTED)
 
 
@@ -341,5 +534,7 @@ if __name__ == '__main__':
         parser.error('--port must be between 1024 and 65535')
     JOBS.mkdir(parents=True, exist_ok=True)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    load_jobs()
+    print(f'Loaded {len(STATE)} saved job(s) from {JOBS}')
     print(f'Serving on http://0.0.0.0:{args.port}')
     ThreadingHTTPServer(('0.0.0.0', args.port), App).serve_forever()

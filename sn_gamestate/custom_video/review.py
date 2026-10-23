@@ -3,6 +3,7 @@
 from collections import deque
 import colorsys
 import json
+import os
 from pathlib import Path
 import subprocess
 import zipfile
@@ -37,15 +38,73 @@ def track_color(track):
     return tuple(round(v * 255) for v in rgb[::-1])
 
 
-def trail_points(history, frame, point, max_points):
-    """Clear at gaps or very large jumps; never draw a bridge across missing data."""
-    if history and (history[-1][0] != frame - 1
+def trail_points(history, frame, point, max_points, frame_step=1):
+    """Clear at gaps or very large jumps; never draw a bridge across missing data.
+
+    With frame sampling, consecutive analysed frames are ``frame_step`` apart.
+    """
+    if history and (frame - history[-1][0] != frame_step
                     or np.linalg.norm(np.array(point) - history[-1][1]) > 3.):
         history.clear()
     history.append((frame, point))
     while len(history) > max_points:
         history.popleft()
     return [p for _, p in history]
+
+
+# Review video frame rate when frames were sampled sparsely.  The source footage is shown at
+# this rate so playback is smooth; overlays glide between analysed frames (display only).
+REVIEW_FPS = float(os.environ.get('REVIEW_FPS', '25'))
+
+
+def review_frame_plan(analysed_frames, fps, frame_step, review_fps=REVIEW_FPS):
+    """Plan review output frames as ``(source_frame, analysed_index, t)``.
+
+    ``t`` is the fraction of the way from analysed frame ``analysed_index`` to the next one
+    (0 = exactly on an analysed frame).  Without sparse sampling every analysed frame is one
+    output frame.  Gaps larger than ``frame_step`` are held, never interpolated.
+    Returns ``(plan, output_fps)``.
+    """
+    out_step = max(1, round(fps / review_fps))
+    if frame_step <= out_step or len(analysed_frames) < 2:
+        return [(frame, index, 0.0) for index, frame in enumerate(analysed_frames)], fps / frame_step
+    plan = []
+    for index, start in enumerate(analysed_frames):
+        has_next = index + 1 < len(analysed_frames)
+        end = analysed_frames[index + 1] if has_next else start + 1
+        consecutive = has_next and end - start == frame_step
+        for frame in range(start, end, out_step):
+            plan.append((frame, index, (frame - start) / (end - start) if consecutive else 0.0))
+    return plan, fps / out_step
+
+
+def interpolate_rows(rows_a, rows_b, t):
+    """Move each identity seen in both analysed frames a fraction ``t`` towards frame b.
+
+    Display only: rows without a match in b are held where they were observed, and rows that
+    appear only in b are not drawn early.
+    """
+    if t <= 0 or not rows_b:
+        return rows_a
+    by_identity = {row.get('identity_id'): row for row in rows_b if pd.notna(row.get('identity_id'))}
+    result = []
+    for row in rows_a:
+        identity = row.get('identity_id')
+        other = by_identity.get(identity) if pd.notna(identity) else None
+        if other is None:
+            result.append(row)
+            continue
+        row = dict(row)
+        start = np.asarray(row['bbox_ltwh'], dtype=float)
+        end = np.asarray(other['bbox_ltwh'], dtype=float)
+        row['bbox_ltwh'] = start + (end - start) * t
+        pa, pb = _finite_pitch(row.get('bbox_pitch')), _finite_pitch(other.get('bbox_pitch'))
+        if pa and pb:
+            row['bbox_pitch'] = dict(row['bbox_pitch'],
+                                     x_bottom_middle=pa['pitch_x'] + (pb['pitch_x'] - pa['pitch_x']) * t,
+                                     y_bottom_middle=pa['pitch_y'] + (pb['pitch_y'] - pa['pitch_y']) * t)
+        result.append(row)
+    return result
 
 
 def clean_review(run, output, video_path):
@@ -63,13 +122,25 @@ def clean_review(run, output, video_path):
          for index, value in decisions.items()})
     _, metadata = export_tracking(detections, images, video, output)
     fps = video['fps']
-    duration = len(images) / fps
+    frame_step = int(evidence.get('frame_step') or 1)
+    analysis_fps = fps / frame_step
+    first_frame = int(images.frame.iloc[0]) if len(images) else 0
+    # Frames may have been resized before detection, so boxes must be scaled back to the
+    # source frame.  Older evidence lacks analysis_width: those runs used a 1280 px cap.
+    analysis_width = float(evidence.get('analysis_width') or min(video['width'], 1280))
+    duration = (len(images) * frame_step) / fps
     raw_video = output / 'review_raw.mp4'
     browser_video = output / 'review.mp4'
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f'Cannot open source video for review: {video_path}')
-    writer = cv2.VideoWriter(str(raw_video), cv2.VideoWriter_fourcc(*'mp4v'), fps, (1920, 900))
+    analysed = list(images.iterrows())
+    analysed_frames = [int(image.frame) for _, image in analysed]
+    plan, output_fps = review_frame_plan(analysed_frames, fps, frame_step)
+    rows_by_image = {key: group.to_dict('records') for key, group in detections.groupby('image_id')}
+    snapshots = {0, len(analysed)//4, len(analysed)//2, 3*len(analysed)//4, len(analysed)-1}
+    # Output frames are spaced evenly in source time, so playing at output_fps stays real time.
+    writer = cv2.VideoWriter(str(raw_video), cv2.VideoWriter_fourcc(*'mp4v'), output_fps, (1920, 900))
     if not writer.isOpened():
         raise RuntimeError('Cannot open MP4 encoder')
     histories = {}
@@ -77,13 +148,33 @@ def clean_review(run, output, video_path):
         cv2.putText(canvas, value, point, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
     def pitch_point(x, y):
         return round(1598 + x * 5), round(410 + y * 5)
+    position = 0  # index of the next frame capture.read() returns
     try:
-        for sequence, (image_id, image) in enumerate(images.iterrows()):
+        progress_file = output / 'progress.json'
+        last_report = -1
+        for done, (target, sequence, t) in enumerate(plan):
+            percent = int(done * 100 / max(1, len(plan)))
+            if percent != last_report:
+                last_report = percent
+                try:
+                    progress_file.write_text(json.dumps({'stage': 'review', 'step': done, 'total': len(plan)}))
+                except OSError:
+                    pass
+            image_id, image = analysed[sequence]
+            is_analysed = target == analysed_frames[sequence]
+            # Seek to the output frame's original index; the segment may start after
+            # frame 0 (start_seconds) and frames may be sampled.
+            while position < target:
+                if not capture.grab():
+                    raise ValueError(f'Cannot decode source frame {position}')
+                position += 1
             ok, raw = capture.read()
+            position += 1
             if not ok:
-                raise ValueError(f'Cannot decode source frame {sequence}')
+                raise ValueError(f'Cannot decode source frame {target}')
             if raw.shape[1] > video['width']:
                 raw = cv2.resize(raw, (video['width'], video['height']), interpolation=cv2.INTER_AREA)
+            box_scale = raw.shape[1] / analysis_width
             canvas = np.full((900, 1920, 3), (23, 21, 18), dtype=np.uint8)
             # Fit without distortion, including videos that are not 16:9.
             scale = min(1280/raw.shape[1], 720/raw.shape[0])
@@ -91,7 +182,7 @@ def clean_review(run, output, video_path):
             ox, oy = (1280-w)//2, 80+(720-h)//2
             canvas[oy:oy+h, ox:ox+w] = cv2.resize(raw, (w, h))
             text(canvas, 'MATCH REVIEW', (24, 43), 1., thickness=2)
-            text(canvas, f'{sequence/fps:05.2f} / {duration:.2f} s', (1010, 43), .8)
+            text(canvas, f'{(target - first_frame)/fps:05.2f} / {duration:.2f} s', (1010, 43), .8)
             text(canvas, 'FIELD VIEW', (1338, 110), .95, thickness=2)
             text(canvas, 'Colors identify stable identities, not teams', (1338, 145), .55)
             cv2.rectangle(canvas, pitch_point(-52.5, -34), pitch_point(52.5, 34), (43, 76, 42), -1)
@@ -101,17 +192,22 @@ def clean_review(run, output, video_path):
                 cv2.rectangle(canvas, pitch_point(xa,ya), pitch_point(xb,yb), white, 1)
             cv2.line(canvas,pitch_point(0,-34),pitch_point(0,34),white,1)
             cv2.circle(canvas,pitch_point(0,0),round(9.15*5),white,1)
-            rows = detections[detections.image_id == image_id]
+            rows = rows_by_image.get(image_id, [])
+            if t > 0:
+                next_id = analysed[sequence + 1][0]
+                # Identity ids are only comparable inside one camera segment.
+                if decisions.get(image_id, {}).get('segment_id') == decisions.get(next_id, {}).get('segment_id'):
+                    rows = interpolate_rows(rows, rows_by_image.get(next_id, []), t)
             outside, mapped, untracked, unavailable = 0, 0, 0, 0
             occupied, image_labels = [], []
             # Reserve the actual markers before placing labels so later points
             # cannot cover an earlier ID. Marker locations are never displaced.
-            for _, row in rows.iterrows():
+            for row in rows:
                 p = _finite_pitch(row.get('bbox_pitch'))
-                if pd.notna(row.track_id) and p and abs(p['pitch_x']) <= 52.5 and abs(p['pitch_y']) <= 34:
+                if pd.notna(row.get('track_id')) and p and abs(p['pitch_x']) <= 52.5 and abs(p['pitch_y']) <= 34:
                     px, py = pitch_point(p['pitch_x'], p['pitch_y'])
                     occupied.append((px-6, py-6, px+6, py+6))
-            for _, row in rows.iterrows():
+            for row in rows:
                 identity_value = row.get('identity_id')
                 track = None if pd.isna(identity_value) else int(identity_value)
                 identity_status = row.get('identity_status') or 'untracked'
@@ -122,12 +218,12 @@ def clean_review(run, output, video_path):
                 untracked += int(track is None)
                 unavailable += int(point is None)
                 color = track_color(track) if track is not None and inside else (150, 150, 150)
-                l,t,bw,bh = map(float,row.bbox_ltwh)
-                a = (round(ox+l*scale),round(oy+t*scale))
-                b = (round(ox+(l+bw)*scale),round(oy+(t+bh)*scale))
+                l,top,bw,bh = (float(value) * box_scale for value in row['bbox_ltwh'])
+                a = (round(ox+l*scale),round(oy+top*scale))
+                b = (round(ox+(l+bw)*scale),round(oy+(top+bh)*scale))
                 cv2.rectangle(canvas, a,b,color,1)
                 # Border-truncated boxes remain visible; they are not reliable foot positions.
-                truncated = l <= 0 or t <= 0 or l+bw >= raw.shape[1]-1 or t+bh >= raw.shape[0]-1
+                truncated = l <= 0 or top <= 0 or l+bw >= raw.shape[1]-1 or top+bh >= raw.shape[0]-1
                 status_tag = {'stable': '', 'reconnected': ' R', 'new_after_gap': ' N',
                               'split_on_jump': ' S'}.get(identity_status, ' ?')
                 label = (str(track) + status_tag) if track is not None else '?'
@@ -147,7 +243,7 @@ def clean_review(run, output, video_path):
                 cv2.rectangle(canvas,(lx,ly-20),(lx+size[0]+7,ly+4),(25,25,25),-1)
                 text(canvas,label,(lx+3,ly),.58,color,2)
                 if not inside or track is None:
-                    if track is not None:
+                    if track is not None and is_analysed:
                         histories.pop(track,None)
                     continue
                 mapped += 1
@@ -155,7 +251,11 @@ def clean_review(run, output, video_path):
                 # Identity IDs are only meaningful within a camera segment.
                 segment_id = decisions.get(image_id, {}).get('segment_id')
                 history = histories.setdefault((segment_id, track), deque())
-                trail = trail_points(history,int(image.frame),native,max(2,round(fps*.4)))
+                if is_analysed:
+                    trail = trail_points(history,target,native,max(2,round(analysis_fps*.4)),frame_step)
+                else:
+                    # Between analysed frames: observed trail plus the gliding marker, unrecorded.
+                    trail = ([p for _, p in history] if history and history[-1][0] == analysed_frames[sequence] else []) + [native]
                 if len(trail)>1:
                     cv2.polylines(canvas,[np.array([pitch_point(*p) for p in trail],dtype=np.int32)],False,tuple(v//2 for v in color),1,cv2.LINE_AA)
                 pos = pitch_point(*native)
@@ -178,9 +278,10 @@ def clean_review(run, output, video_path):
                                      'Identity and calibration are unverified.']):
                 text(canvas,line,(1338,640+i*32),.55)
             text(canvas, f'Frame {sequence+1} / {len(images)}   |   * Box touches image border', (24,835),.65)
-            text(canvas, 'Reconnect requires ReID + feasible pitch motion; no positions are filled across gaps.', (24,871),.52)
+            text(canvas, 'Reconnect requires ReID + feasible pitch motion; no positions are filled across gaps.'
+                 + ('  Motion between analysed frames is smoothed for display.' if output_fps > analysis_fps else ''), (24,871),.52)
             writer.write(canvas)
-            if sequence in {0,len(images)//4,len(images)//2,3*len(images)//4,len(images)-1}:
+            if is_analysed and sequence in snapshots:
                 cv2.imwrite(str(output/f'frame_{int(image.frame):03d}.jpg'),canvas)
     finally:
         writer.release()
@@ -188,6 +289,9 @@ def clean_review(run, output, video_path):
     make_browser_video(raw_video, browser_video)
     raw_video.unlink()
     metadata.update(review_layout='clean',review_width=1920,review_height=900,
+                    review_fps=output_fps, analysis_fps=analysis_fps,
+                    review_smoothing=('display-only interpolation between consecutive analysed frames '
+                                      'of the same identity and segment') if output_fps > analysis_fps else 'none',
                     minimap_filter='tracked, finite, inside canonical pitch; raw JSON retained',
                     trails='0.4 s, reset on gaps or >3 m consecutive displacement',
                     identity_summary=identity_summary,
